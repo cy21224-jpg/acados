@@ -28,4 +28,3 @@ volatile double mpc_measured_x[MPC_STATE_DIM] = {NAN, NAN, NAN, NAN};
 volatile double mpc_x0[MPC_STATE_DIM] = {NAN, NAN, NAN, NAN};
 volatile double mpc_u0 = NAN;
 volatile double mpc_u1 = NAN;
-
