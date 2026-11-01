@@ -1,0 +1,127 @@
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -157,23 +157,6 @@
+       Error_Handler();
+   }
+ 
+-  mpc_capsule = interaction_model_acados_create_capsule();
+-
+-  if (mpc_capsule == NULL)
+-  {
+-      mpc_create_status = -1;
+-      Error_Handler();
+-  }
+-
+-  mpc_create_status =
+-      interaction_model_acados_create(mpc_capsule);
+-
+-  if (mpc_create_status != 0)
+-  {
+-      Error_Handler();
+-  }
+-
+-
+   /* 古いFault情報をクリア */
+   *(volatile uint32_t *)0xE000EFA8 = 0xFFFFFFFFU; // ABFSR
+   *(volatile uint32_t *)0xE000ED28 = 0xFFFFFFFFU; // CFSR
+--- a/Core/Src/stm32f7xx_it.c
++++ b/Core/Src/stm32f7xx_it.c
+@@ -100,6 +100,9 @@
+ volatile uint32_t g_hf_abfsr = 0;
+ volatile uint32_t g_hf_cfsr  = 0;
+ volatile uint32_t g_hf_hfsr  = 0;
++volatile uint32_t g_hf_bfar = 0;
++volatile uint32_t g_hf_mmfar = 0;
++volatile uint32_t g_hf_frame_valid = 0;
+ 
+ void hardfault_c(uint32_t *stack, uint32_t exc_return)
+ {
+@@ -108,18 +111,26 @@
+     g_hf_exc_return = exc_return;
+     g_hf_stack_ptr = (uint32_t)stack;
+ 
+-    /* FPU拡張スタックフレームの場合 */
+-    if ((exc_return & 0x10U) == 0U)
++    /* Save fault status before reading a potentially damaged exception frame. */
++    g_hf_abfsr = *(volatile uint32_t *)0xE000EFA8;
++    g_hf_cfsr  = SCB->CFSR;
++    g_hf_hfsr  = SCB->HFSR;
++    g_hf_bfar = SCB->BFAR;  /* meaningful only if CFSR.BFARVALID is set */
++    g_hf_mmfar = SCB->MMFAR; /* meaningful only if CFSR.MMARVALID is set */
++    g_hf_frame_valid = 0;
++
++    /* Cortex-M7 places R0..xPSR first, even in an extended FP frame.
++       The optional S0..S15/FPSCR area follows these eight core words. */
++    uint32_t frame_address = (uint32_t)core_frame;
++    if ((g_hf_cfsr & 0x00003838U) == 0U &&
++        (frame_address & 3U) == 0U &&
++        frame_address >= 0x20000000U && frame_address <= 0x2007FFE0U)
+     {
+-        core_frame += 18;
++        g_hf_stacked_lr   = core_frame[5];
++        g_hf_stacked_pc   = core_frame[6];
++        g_hf_stacked_xpsr = core_frame[7];
++        g_hf_frame_valid = 1;
+     }
+-
+-    g_hf_stacked_lr   = core_frame[5];
+-    g_hf_stacked_pc   = core_frame[6];
+-    g_hf_stacked_xpsr = core_frame[7];
+-    g_hf_abfsr = *(volatile uint32_t *)0xE000EFA8;
+-    g_hf_cfsr  = *(volatile uint32_t *)0xE000ED28;
+-    g_hf_hfsr  = *(volatile uint32_t *)0xE000ED2C;
+ 
+     while (1)
+     {
+--- a/Core/Src/sysmem.c
++++ b/Core/Src/sysmem.c
+@@ -23,11 +23,15 @@
+ /* Includes */
+ #include <errno.h>
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ /**
+  * Pointer to the current high watermark of the heap usage
+  */
+ static uint8_t *__sbrk_heap_end = NULL;
++extern volatile uint32_t g_heap_peak_bytes;
++volatile uint32_t g_heap_failed_requests = 0U;
++volatile ptrdiff_t g_heap_last_failed_incr = 0;
+ 
+ /**
+  * @brief _sbrk() allocates memory to the newlib heap and is used by malloc
+@@ -65,15 +69,30 @@
+     __sbrk_heap_end = &_end;
+   }
+ 
+-  /* Protect heap from growing into the reserved MSP stack */
+-  if (__sbrk_heap_end + incr > max_heap)
++  /* Use integer bounds checks to avoid out-of-range pointer arithmetic,
++     and protect against shrinking below the heap start. */
++  uintptr_t current = (uintptr_t)__sbrk_heap_end;
++  uintptr_t lower = (uintptr_t)&_end;
++  uintptr_t upper = (uintptr_t)max_heap;
++  uintptr_t shrink = (incr < 0) ? (uintptr_t)(-(incr + 1)) + 1U : 0U;
++  if (current < lower || current > upper ||
++      (incr >= 0 && (uintptr_t)incr > upper - current) ||
++      (incr < 0 && shrink > current - lower))
+   {
++    g_heap_failed_requests++;
++    g_heap_last_failed_incr = incr;
+     errno = ENOMEM;
+     return (void *)-1;
+   }
+ 
+   prev_heap_end = __sbrk_heap_end;
+-  __sbrk_heap_end += incr;
++  current = (incr >= 0) ? current + (uintptr_t)incr : current - shrink;
++  __sbrk_heap_end = (uint8_t *)current;
++  uint32_t used = (uint32_t)(current - lower);
++  if (used > g_heap_peak_bytes)
++  {
++    g_heap_peak_bytes = used;
++  }
+ 
+   return (void *)prev_heap_end;
+ }
