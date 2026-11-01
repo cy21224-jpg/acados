@@ -34,8 +34,26 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 計算終了後の待ち時間。計算・UART出力の時間も加わるため、厳密な1 ms周期ではない。 */
-#define MPC_LOOP_DELAY_MS 1U
+/* 性能測定版：NUCLEO-F767ZI相当、HSE=8 MHz bypass、3.3 V動作を前提とする。
+   CubeIDEのMCU GCC Compiler / Optimizationを-O2にし、Clean Buildすること。
+   main.cだけの最適化では生成されたCasADi関数の-O0は解消しない。 */
+#ifndef MPC_CPU_216MHZ
+#define MPC_CPU_216MHZ 1
+#endif
+/* 1 ms運転中はUARTを止め、Expressionsで計測する。表示が必要な測定時だけ1へ。 */
+#ifndef MPC_ENABLE_UART_REPORT
+#define MPC_ENABLE_UART_REPORT 0
+#endif
+/* 今までのsin模擬入力を継続する。実センサを使うときは0にする。 */
+#ifndef MPC_USE_SINE_TEST
+#define MPC_USE_SINE_TEST 1
+#endif
+#define MPC_DEADLINE_US 1000U
+#if MPC_CPU_216MHZ
+_Static_assert(HSE_VALUE == 8000000U, "216 MHz configuration requires an 8 MHz HSE bypass input");
+#endif
+/* 意図的な待機は0。周期を保証するスケジューラではなく、処理時間をまず測定する。 */
+#define MPC_LOOP_DELAY_MS 0U
 /* UARTの連続出力で計算を妨げすぎないよう、通常は1秒ごとに表示する。 */
 #define MPC_REPORT_INTERVAL_MS 1000U
 /* 現在のモデルの入力制約。初期化後はMPC_UpdateInputBounds()でも変更できる。 */
@@ -93,6 +111,8 @@ static int mpc_state_pending = 0;
 static int mpc_has_warm_start = 0;
 static double mpc_previous_u[INTERACTION_MODEL_N];
 static uint32_t mpc_last_report_tick = 0U;
+/* UART無効時は制御開始後のライブラリ内部printfもブロックさせない。 */
+static volatile int mpc_control_running = 0;
 
 /* センサ側は4値を同じサンプルとして書き、最後にready=1を設定する。
    デバッガで試す場合も4値を書いてからsensor_sample_ready=1にする。
@@ -116,6 +136,16 @@ volatile uint32_t mpc_failure_count = 0U;
 volatile int mpc_result_valid = 0;
 volatile uint32_t mpc_result_sample_id = 0U;
 volatile uint32_t mpc_solve_time_ms = 0U;
+/* DWTでソルバ単体と、状態更新から結果取得までを計測する。
+   割込みによる中断時間も含む。maxは起動後の初回・失敗時も含める。 */
+volatile uint32_t mpc_cpu_hz = 0U;
+volatile uint32_t mpc_icache_enabled = 0U;
+volatile uint32_t mpc_cycle_counter_enabled = 0U;
+volatile uint32_t mpc_solve_us = 0U;
+volatile uint32_t mpc_solve_us_max = 0U;
+volatile uint32_t mpc_control_us = 0U;
+volatile uint32_t mpc_control_us_max = 0U;
+volatile uint32_t mpc_deadline_misses = 0U;
 volatile double mpc_input_lower = MPC_INPUT_MIN;
 volatile double mpc_input_upper = MPC_INPUT_MAX;
 /* measured_xは実測入力、x0はソルバ出力。両者を混同しない。 */
@@ -135,6 +165,10 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 /* センサ取得、初期化、制約更新、計算実行、表示の役割を関数で分離する。 */
+static void CPU_EnableInstructionCache(void);
+static void MPC_InitCycleCounter(void);
+static uint32_t MPC_CyclesToUs(uint32_t cycles);
+static void MPC_RecordControlTime(uint32_t start_cycles);
 static int Sensors_ReadState(double state[4]);
 static int MPC_Init(void);
 static void MPC_InvalidateResult(void);
@@ -142,7 +176,9 @@ static int MPC_UpdateInitialState(const double measured_state[4]);
 static int MPC_UpdateInputBounds(double lower, double upper);
 static void MPC_PrepareWarmStart(void);
 static int MPC_Execute(void);
+#if MPC_ENABLE_UART_REPORT
 static void MPC_PrintResult(void);
+#endif
 
 /* USER CODE END PFP */
 
@@ -155,10 +191,55 @@ static void MPC_PrintResult(void);
 #endif
 PUTCHAR_PROTOTYPE
 {
+#if !MPC_ENABLE_UART_REPORT
+    /* 初期化メッセージだけ出力し、制御中はprintf文字を送信せずに戻す。 */
+    if (mpc_control_running) return ch;
+#endif
 	HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xFFFF);
 	return ch;
 }
 
+
+/* 命令キャッシュだけを有効化する。DMAバッファの整合性に影響するD-cacheは変更しない。 */
+static void CPU_EnableInstructionCache(void)
+{
+    if ((SCB->CCR & SCB_CCR_IC_Msk) == 0U) SCB_EnableICache();
+    mpc_icache_enabled = (SCB->CCR & SCB_CCR_IC_Msk) != 0U;
+}
+
+/* 1 ms粒度のHAL_GetTickと別に、CPUサイクルカウンタを起動する。 */
+static void MPC_InitCycleCounter(void)
+{
+    mpc_cpu_hz = HAL_RCC_GetHCLKFreq();
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = 0xC5ACCE55U;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    __DSB();
+    __ISB();
+    uint32_t probe_before = DWT->CYCCNT;
+    for (volatile uint32_t probe = 0U; probe < 16U; probe++) __NOP();
+    uint32_t probe_after = DWT->CYCCNT;
+    mpc_cycle_counter_enabled = ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U &&
+                               (DWT->CTRL & DWT_CTRL_NOCYCCNT_Msk) == 0U &&
+                               probe_after != probe_before);
+}
+
+/* マイクロ秒に切り上げる。計測1回はCYCCNTの周回時間より短いことが前提。 */
+static uint32_t MPC_CyclesToUs(uint32_t cycles)
+{
+    if (!mpc_cycle_counter_enabled || mpc_cpu_hz == 0U) return 0U;
+    return (uint32_t)(((uint64_t)cycles * 1000000ULL + mpc_cpu_hz - 1U) / mpc_cpu_hz);
+}
+
+/* 制約更新・ウォームスタート・solve・結果取得の合計と、1 ms超過回数を記録する。
+   UART表示はこの計測範囲外。実制御では表示を無効にして周期全体も測定する。 */
+static void MPC_RecordControlTime(uint32_t start_cycles)
+{
+    mpc_control_us = MPC_CyclesToUs(DWT->CYCCNT - start_cycles);
+    if (mpc_control_us > mpc_control_us_max) mpc_control_us_max = mpc_control_us;
+    if (mpc_control_us > MPC_DEADLINE_US) mpc_deadline_misses++;
+}
 
 /* センサが用意した4状態を、割込みによる書き換えから保護してコピーする。
    センサ側の同一割込みで4値を書き、最後にready=1とする運用を想定する。
@@ -191,6 +272,7 @@ static void MPC_InvalidateResult(void)
     mpc_u0 = NAN;
     mpc_u1 = NAN;
     mpc_solve_time_ms = 0U;
+    mpc_solve_us = 0U;
     for (int i = 0; i < 4; i++) mpc_x0[i] = NAN;
 }
 
@@ -325,8 +407,12 @@ static int MPC_Execute(void)
     /* 予測値の準備は制約を変更する処理とは分けて行う。 */
     MPC_PrepareWarmStart();
     uint32_t start_tick = HAL_GetTick();
+    uint32_t start_cycles = DWT->CYCCNT;
     mpc_solve_status = interaction_model_acados_solve(mpc_capsule);
+    uint32_t end_cycles = DWT->CYCCNT;
     mpc_solve_time_ms = HAL_GetTick() - start_tick;
+    mpc_solve_us = MPC_CyclesToUs(end_cycles - start_cycles);
+    if (mpc_solve_us > mpc_solve_us_max) mpc_solve_us_max = mpc_solve_us;
     mpc_iteration_count++;
     if (mpc_solve_status != 0)
     {
@@ -366,10 +452,16 @@ static int MPC_Execute(void)
     return (mpc_step_status = 0);
 }
 
+#if MPC_ENABLE_UART_REPORT
 /* センサ入力とソルバ出力を区別してUARTへ表示する。 */
 static void MPC_PrintResult(void)
 {
     printf("\r\n========== Sensor MPC ==========\r\n");
+    printf("hclk=%lu icache=%lu dwt=%lu solve_us=%lu max=%lu control_us=%lu max=%lu misses_1ms=%lu\r\n",
+           (unsigned long)mpc_cpu_hz, (unsigned long)mpc_icache_enabled,
+           (unsigned long)mpc_cycle_counter_enabled, (unsigned long)mpc_solve_us,
+           (unsigned long)mpc_solve_us_max, (unsigned long)mpc_control_us,
+           (unsigned long)mpc_control_us_max, (unsigned long)mpc_deadline_misses);
     printf("samples=%lu solves=%lu success=%lu failure=%lu\r\n",
            (unsigned long)mpc_sample_count, (unsigned long)mpc_iteration_count,
            (unsigned long)mpc_success_count, (unsigned long)mpc_failure_count);
@@ -390,6 +482,8 @@ static void MPC_PrintResult(void)
     printf("================================\r\n");
 }
 
+#endif /* MPC_ENABLE_UART_REPORT */
+
 /* USER CODE END 0 */
 
 /**
@@ -400,6 +494,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  /* 初期化前にI-cacheを有効化し、Flash上の命令取得を高速化する。 */
+  CPU_EnableInstructionCache();
 
   /* USER CODE END 1 */
 
@@ -416,6 +512,8 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  /* 最終クロック設定後のHCLKを使ってDWT計時を初期化する。 */
+  MPC_InitCycleCounter();
 
   /* USER CODE END SysInit */
 
@@ -439,7 +537,11 @@ int main(void)
       Error_Handler();
   }
   printf("MPC initialized. Waiting for sensor_state[4] and sensor_sample_ready=1.\r\n");
+  printf("Performance: HCLK=%lu Hz ICache=%lu DWT=%lu UART_REPORT=%d. Watch mpc_solve_us / mpc_control_us_max.\r\n",
+         (unsigned long)mpc_cpu_hz, (unsigned long)mpc_icache_enabled,
+         (unsigned long)mpc_cycle_counter_enabled, MPC_ENABLE_UART_REPORT);
   mpc_last_report_tick = HAL_GetTick();
+  mpc_control_running = 1;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -449,6 +551,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+      uint32_t control_start_cycles = DWT->CYCCNT;
+#if MPC_USE_SINE_TEST
+      /* 最新の動作確認例と同じ、状態1/2のsin波と状態3=1、状態4=100を入力する。 */
+      double t_s = (double)HAL_GetTick() * 0.001;
+      double wave = 0.1 * sin(2.0 * 3.141592653589793 * 0.5 * t_s);
+      sensor_state[0] = wave;
+      sensor_state[1] = wave;
+      sensor_state[2] = 1.0;
+      sensor_state[3] = 100.0;
+      sensor_sample_ready = 1;
+#endif
       /* 1. センサから今回の4状態を受け取る。未着ならsolveせずに待つ。 */
       double measured_state[4];
       mpc_sensor_status = Sensors_ReadState(measured_state);
@@ -490,6 +603,9 @@ int main(void)
           mpc_failure_count++;
       }
 
+      if (mpc_sensor_status != 0) MPC_RecordControlTime(control_start_cycles);
+
+#if MPC_ENABLE_UART_REPORT
       /* 5. 初回のサンプル処理と、それ以後は約1秒ごとに状態を表示する。 */
       if ((mpc_sensor_status == 1 && mpc_sample_count == 1U) ||
           (uint32_t)(HAL_GetTick() - mpc_last_report_tick) >= MPC_REPORT_INTERVAL_MS)
@@ -497,8 +613,11 @@ int main(void)
           MPC_PrintResult();
           mpc_last_report_tick = HAL_GetTick();
       }
-      /* 6. 動作確認用の待機。計算時間も加わるため、厳密な1 ms周期ではない。 */
+#endif
+      /* 待機0でもHAL_Delay(0)は1 tick待つ実装があるので、関数自体を呼ばない。 */
+#if MPC_LOOP_DELAY_MS > 0U
       HAL_Delay(MPC_LOOP_DELAY_MS);
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -519,7 +638,11 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
+#if MPC_CPU_216MHZ
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+#else
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+#endif
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -529,9 +652,18 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 4;
+#if MPC_CPU_216MHZ
+  /* 8 MHz / 4 * 216 / 2 = 216 MHz、USB用Q出力は432 / 9 = 48 MHz。 */
+  RCC_OscInitStruct.PLL.PLLN = 216;
+#else
   RCC_OscInitStruct.PLL.PLLN = 96;
+#endif
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+#if MPC_CPU_216MHZ
+  RCC_OscInitStruct.PLL.PLLQ = 9;
+#else
   RCC_OscInitStruct.PLL.PLLQ = 4;
+#endif
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -551,10 +683,20 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+#if MPC_CPU_216MHZ
+  /* F767のAPB1/APB2の上限に合わせ、54 MHz/108 MHzにする。 */
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+#else
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+#endif
 
+#if MPC_CPU_216MHZ
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
+#else
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+#endif
   {
     Error_Handler();
   }
@@ -627,7 +769,9 @@ static void MX_TIM7_Init(void)
 
   /* USER CODE END TIM7_Init 1 */
   htim7.Instance = TIM7;
-  htim7.Init.Prescaler = 96-1;
+  /* このクロック設定ではAPB1分周>1、TIMPRE=0なのでTIM7の入力はPCLK1*2。 */
+  __HAL_RCC_TIMCLKPRESCALER(RCC_TIMPRES_DESACTIVATED);
+  htim7.Init.Prescaler = (HAL_RCC_GetPCLK1Freq() * 2U) / 1000000U - 1U;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim7.Init.Period = 1000-1;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
