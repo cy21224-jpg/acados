@@ -1,0 +1,165 @@
+--- main.c.before
++++ main.c.after
+@@ -22,6 +22,7 @@
+ 
+ /* Private includes ----------------------------------------------------------*/
+ /* USER CODE BEGIN Includes */
++#include "MPC_timing.h"
+ #include <stdio.h>
+ #include <math.h>
+ #include "dma_printf.h"
+@@ -86,6 +87,13 @@
+ PCD_HandleTypeDef hpcd_USB_OTG_FS;
+ 
+ /* USER CODE BEGIN PV */
++/* 既存TIMを変更せず、MPC処理時間をDWTで観測する。 */
++volatile int mpc_dwt_status = -999;
++volatile uint32_t mpc_total_cycles = 0U;
++volatile uint32_t mpc_total_time_us = 0U;
++volatile uint32_t mpc_max_time_us = 0U;
++volatile uint32_t mpc_overrun_count = 0U;
++
+ 
+ /* MPC parameters */
+ volatile double sensor_state[4] = {0.0, 0.0, 0.0, 0.0};
+@@ -135,6 +143,8 @@
+ 
+   /* Configure the system clock */
+   SystemClock_Config();
++  /* CPUサイクルカウンタだけを準備する。TIM/CPU周波数は変更しない。 */
++  mpc_dwt_status = MPC_CycleCounterInit();
+ 
+   /* USER CODE BEGIN SysInit */
+ 
+@@ -195,7 +205,7 @@
+ 		printf("Error: input bounds update failed: %d\r\n", (int)mpc_update_status);
+ 		Error_Handler();
+ 	}
+-	printf("MPC initialized. Waiting for sensor_state[4] and sensor_sample_ready=1.\r\n");
++	printf("MPC initialized. Waiting for valid EKF states, equivalent mass and contact condition.\r\n");
+ 
+ 
+   /* USER CODE END 2 */
+@@ -1075,52 +1085,61 @@
+ 				}
+ 
+ 
+-				/*MPCによる指令値生成*/
+-				double measured_state[4];
+-				measured_state[0]=dx_w_res[1];
+-				measured_state[1]=x_w_res[1];
+-				//TODO:本来はEKFで動的に変更するが今回は固定
+-				y_k[0]=dx_w_res[0];
+-				y_k[1]=x_w_res[1];
+-
+-				EKF(y_k, u_k_1, M_w_eq[0][0], x_hat_k_1, P_k_1, Rkf, Qkf, x_hat_k, P_k);
+-
+-				//printf("M:%lf dot_x:%lf x:%lf c:%lf k:%lf  \n\r",M_w_eq[0][0],x_hat_k[0],x_hat_k[1],x_hat_k[2],x_hat_k[3]);
+-
+-				measured_state[2]=x_hat_k[2];
+-				measured_state[3]=x_hat_k[3];
+-				if(hat_f_env[0]>0){
+-					mpc_sensor_status=1;
+-				}else{
+-					mpc_sensor_status=0;
+-				}
+-				if (mpc_sensor_status == 1)
+-				{
+-				  /* 2. stage 0の下限と上限を測定値にそろえ、初期状態を固定する。 */
+-				  mpc_update_status = MPC_UpdateInitialState(measured_state);
+-				  if (mpc_update_status == 0)
+-				  {
+-					  /* 3. 更新した制約を使って、今回の制御入力を計算する。 */
+-					  mpc_step_status = MPC_Execute();
+-					  /* 4. 有効な計算結果を得たときだけ、実機へ今回の入力u0を渡す。 */
+-					  if (mpc_step_status == 0 && mpc_result_valid)
+-					  {
+-						  /* 本来は加速度指令値なので完成で割らなければいけないが今回は保留 */
+-						  //printf("%lf \r\n",mpc_u0);
+-					  }
+-					  else
+-					  {
+-						  /* 異常時の実機停止などを追加する位置。古いmpc_u0を使わない。 */
+-					  }
+-				  }
+-				  else
+-				  {
+-					  mpc_step_status = mpc_update_status;
+-					  mpc_failure_count++;
+-				  }
+-				}
+-
+-
++				/* MPCによる指令値生成：X方向のEKF推定値と等価質量を使用する。 */
++                const double equivalent_mass = (double)M_w_eq[0][0];
++                mpc_sensor_status = 0;
++                if (!isfinite(equivalent_mass) || equivalent_mass <= 0.0)
++                {
++                    /* 無効な質量をEKF/MPCへ渡さず、前回のMPC結果も無効化する。 */
++                    mpc_mass_update_status = MPC_UpdateModelMass(equivalent_mass);
++                    mpc_update_status = mpc_mass_update_status;
++                    mpc_step_status = mpc_mass_update_status;
++                    mpc_sensor_status = -1;
++                }
++                else
++                {
++                    /* 既存EKFを呼ぶ。観測をX方向の速度・位置にそろえる。 */
++                    y_k[0] = dx_w_res[0];
++                    y_k[1] = x_w_res[0];
++                    EKF(y_k, u_k_1, equivalent_mass, x_hat_k_1,
++                        P_k_1, Rkf, Qkf, x_hat_k, P_k);
++
++                    /* 状態4個すべてを今回のEKF推定値から用意する。 */
++                    const double measured_state[4] = {
++                        (double)x_hat_k[0], (double)x_hat_k[1],
++                        (double)x_hat_k[2], (double)x_hat_k[3]
++                    };
++                    if (hat_f_env[0] > 0)
++                    {
++                        /* 既存の接触時だけ計算する条件を維持する。 */
++                        mpc_sensor_status = 1;
++                        const uint32_t start_cycles = mpc_dwt_status == 0
++                                                    ? MPC_CycleCounterRead() : 0U;
++                        mpc_mass_update_status = MPC_UpdateModelMass(equivalent_mass);
++                        mpc_update_status = -999;
++                        mpc_step_status = mpc_mass_update_status;
++                        if (mpc_mass_update_status == 0)
++                        {
++                            mpc_sample_count++;
++                            mpc_update_status = MPC_UpdateInitialState(measured_state);
++                            mpc_step_status = mpc_update_status;
++                            if (mpc_update_status == 0)
++                                mpc_step_status = MPC_Execute();
++                        }
++                        /* EKFより後のMPC更新～結果取得をDWTで計測する。 */
++                        if (mpc_dwt_status == 0)
++                        {
++                            mpc_total_cycles = MPC_CycleCounterRead() - start_cycles;
++                            mpc_total_time_us = MPC_CyclesToMicroseconds(mpc_total_cycles);
++                            if (mpc_total_time_us > mpc_max_time_us)
++                                mpc_max_time_us = mpc_total_time_us;
++                            if ((uint64_t)mpc_total_cycles * 1000ULL > SystemCoreClock)
++                                mpc_overrun_count++;
++                        }
++                    }
++                }
++
++
+ 				for (i = 0; i < 3; i++){
+ 					//位置のPD
+ 					//ddx_w_ref[i] = Kpp_w[i][i] * (x_w_cmd[i] - x_w_res[i]) + Kpd_w[i][i] * (dx_w_cmd[i] - dx_w_res[i]);
+@@ -1134,12 +1153,13 @@
+ 				 * mpc_u0の物理量・単位が加速度指令に一致することが前提。
+ 				 */
+ 				if (mpc_sensor_status == 1 &&
++                    mpc_mass_update_status == 0 &&
+ 				    mpc_update_status == 0 &&
+ 				    mpc_step_status == 0 &&
+ 				    mpc_result_valid)
+ 				{
+ 					/*加速度指令値に変換*/
+-				    ddx_w_ref[0] = (float)mpc_u0/M_w_eq[0][0];
++				    ddx_w_ref[0] = (float)(mpc_u0 / mpc_model_mass);
+ 				}
+ 
+ 				for (i = 0; i < 3; i++){

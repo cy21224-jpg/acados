@@ -1,0 +1,90 @@
+/* この内容はmainへ追加・置換する例です。main全体を置き換えるファイルではありません。 */
+
+/* 1. USER CODE BEGIN Includesへ追加する（MPC_function.h/MPC_param.hは既存のまま）。 */
+#include "MPC_timing.h"
+
+/* 2. USER CODE BEGIN PVへ、DWT計測結果を置く。 */
+volatile int mpc_dwt_status = -999;
+volatile uint32_t mpc_total_cycles = 0U;
+volatile uint32_t mpc_total_time_us = 0U;
+volatile uint32_t mpc_max_time_us = 0U;
+volatile uint32_t mpc_overrun_count = 0U;
+
+/* 3. mainのクロック設定が完了した後、起動時に1回追加する。
+ * 周辺機器TIMの設定・制御周期・CPU周波数は変更しない。
+ */
+mpc_dwt_status = MPC_CycleCounterInit();
+
+/* 4. 既存のMPC初期化部分は維持する。
+ * MPC_SetTickProvider(HAL_GetTick)は必要ならMPC_Init()より前に登録できるが、
+ * 高優先度IRQ内ではHAL_GetTickが進まない場合がある。以下のus計測を使う。
+ */
+
+/* 5. X方向のEKF入力は既存の取得箇所で次の対応を維持する。
+ * EKFの型・前回入力・初期値・共分散・戻り値の扱いは手元の実装に従う。
+ * 質量が正で有限なことと、Jの逆行列計算の成功はEKFを呼ぶ前にも確認する。
+ */
+y_k[0] = dx_w_res[0];
+y_k[1] = x_w_res[0];
+
+/* 6. EKFの今回の計算が成功し、x_hat_k[0..3]が有効となった後に使う。
+ * このブロックは既存の「MPCを実行する条件」の中へ置き、旧MPC計算部分と置換する。
+ * y_k/x_hat_kの定義やEKF本体をこのパッケージが変更することはない。
+ */
+{
+    const double equivalent_mass = (double)M_w_eq[0][0];
+    const double estimated_state[4] = {
+        (double)x_hat_k[0], /* X方向の推定速度 */
+        (double)x_hat_k[1], /* X方向の推定位置 */
+        (double)x_hat_k[2], /* 環境粘性 */
+        (double)x_hat_k[3]  /* 環境剛性 */
+    };
+    const uint32_t start_cycles = mpc_dwt_status == 0
+                                 ? MPC_CycleCounterRead() : 0U;
+
+    /* 順序を維持する：質量更新→初期状態更新→最適化。
+     * 質量更新は前回の結果と未実行の状態入力を無効化する。
+     */
+    mpc_mass_update_status = MPC_UpdateModelMass(equivalent_mass);
+    mpc_update_status = -999;
+    mpc_step_status = mpc_mass_update_status;
+    if (mpc_mass_update_status == 0)
+    {
+        mpc_sample_count++;
+        mpc_update_status = MPC_UpdateInitialState(estimated_state);
+        mpc_step_status = mpc_update_status;
+        if (mpc_update_status == 0)
+            mpc_step_status = MPC_Execute();
+    }
+
+    /* 計測対象は質量更新・初期状態更新・ウォームスタート準備・solve・結果取得。
+     * EKF、逆行列、DAC、その他のTIM7処理はこの計測には含まない。
+     */
+    if (mpc_dwt_status == 0)
+    {
+        mpc_total_cycles = MPC_CycleCounterRead() - start_cycles;
+        mpc_total_time_us = MPC_CyclesToMicroseconds(mpc_total_cycles);
+        if (mpc_total_time_us > mpc_max_time_us)
+            mpc_max_time_us = mpc_total_time_us;
+        if ((uint64_t)mpc_total_cycles * 1000ULL > SystemCoreClock)
+            mpc_overrun_count++;
+    }
+}
+
+/* 7. 既存のX方向への適用箇所では、今回の更新とsolveの成功を確認する。
+ * 元の制御式でddx_w_refを作った後、補償・逆ヤコビアン処理の前に置く。
+ * mpc_model_massは、今回MPCに設定できた質量。mpc_u0は力[N]。
+ */
+if (mpc_sensor_status == 1 &&
+    mpc_mass_update_status == 0 &&
+    mpc_update_status == 0 &&
+    mpc_step_status == 0 &&
+    mpc_result_valid)
+{
+    ddx_w_ref[0] = (float)(mpc_u0 / mpc_model_mass);
+}
+
+/* 8. 毎1msの結果が必要なら、MPCだけでなくTIM7の処理全体を同じDWTで計測する。
+ * TIM7分岐の入口でstart、同分岐の出口でendを取り、全体が1ms未満か確認する。
+ * 1msを超えたことを検出するコードであり、計算時間を自動で短縮するものではない。
+ */
