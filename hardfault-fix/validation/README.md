@@ -7,6 +7,7 @@ From the hardfault-fix directory, run:
 python validation/emulate.py firmware/acadosdayo.elf
 python validation/test_fault_frame.py firmware/acadosdayo.elf
 python validation/test_heap.py firmware/acadosdayo.elf
+python validation/test_control_output.py firmware/acadosdayo.elf
 ```
 
 Peripheral initialization is skipped. ARM MAX is used to execute double-precision instructions; this is not a complete Cortex-M7 or STM32 board emulator. Assertion failures return nonzero. Hardware verification remains necessary.

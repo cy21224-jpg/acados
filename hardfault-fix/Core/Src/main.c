@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <math.h>
 #include "acados_solver_interaction_model.h"
 /* USER CODE END Includes */
 
@@ -33,6 +34,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* Absolute tolerance in each variable's model units; not a safety margin. */
+#define MPC_BOUND_TOL 1.0e-6
+#define MPC_CHECK_SOLVER_FAILED  1U
+#define MPC_CHECK_NONFINITE      2U
+#define MPC_CHECK_INPUT_BOUNDS   4U
+#define MPC_CHECK_STATE_BOUNDS   8U
+#define MPC_CHECK_MODEL_CONFIG 16U
+
+/* This diagnostic targets the supplied one-input, four-state model. */
+_Static_assert(INTERACTION_MODEL_NU == 1 && INTERACTION_MODEL_NBU == 1,
+               "Update diagnostics for the new control dimensions");
+_Static_assert(INTERACTION_MODEL_NBX0 == INTERACTION_MODEL_NX &&
+               INTERACTION_MODEL_NBX == INTERACTION_MODEL_NX &&
+               INTERACTION_MODEL_NBXN == INTERACTION_MODEL_NX,
+               "Update diagnostics for the new state bound dimensions");
 
 /* USER CODE END PD */
 
@@ -77,6 +93,21 @@ volatile int mpc_create_status = -999;
 volatile int mpc_solve_status = -999;
 volatile uint32_t g_heap_peak_bytes = 0U;
 
+/* Expressions: -999 = not checked; 0 = numeric/bound checks passed.
+   Nonzero values are a bit mask of MPC_CHECK_* above. */
+volatile int mpc_check_status = -999;
+volatile int mpc_check_done = 0;
+volatile int mpc_first_bad_stage = -1;
+volatile double mpc_u0 = NAN;
+volatile double mpc_u_lower[INTERACTION_MODEL_N];
+volatile double mpc_u_upper[INTERACTION_MODEL_N];
+volatile double mpc_u_pred[INTERACTION_MODEL_N];
+volatile double mpc_x_pred[INTERACTION_MODEL_N + 1][INTERACTION_MODEL_NX];
+volatile double mpc_max_u_violation = 0.0;
+volatile double mpc_max_x_violation = 0.0;
+/* A range at x[0] is not an actual measured initial state. */
+volatile int mpc_initial_state_fixed = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,6 +132,143 @@ PUTCHAR_PROTOTYPE
 {
 	HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xFFFF);
 	return ch;
+}
+
+
+/* Read the actual solver bounds rather than duplicating generated constants.
+   This is a diagnostic only: it does not command an actuator or clamp output. */
+static void MPC_CheckSolution(void)
+{
+    unsigned int flags = 0U;
+    int first_bad = -1;
+    int initial_fixed = 1;
+    double max_u_violation = 0.0;
+    double max_x_violation = 0.0;
+    mpc_check_done = 0;
+    mpc_check_status = -999;
+    mpc_first_bad_stage = -1;
+    mpc_u0 = NAN;
+    mpc_initial_state_fixed = 0;
+    mpc_max_u_violation = 0.0;
+    mpc_max_x_violation = 0.0;
+    for (int k = 0; k <= INTERACTION_MODEL_N; k++)
+    {
+        for (int j = 0; j < INTERACTION_MODEL_NX; j++)
+            mpc_x_pred[k][j] = NAN;
+        if (k < INTERACTION_MODEL_N)
+        {
+            mpc_u_pred[k] = NAN;
+            mpc_u_lower[k] = NAN;
+            mpc_u_upper[k] = NAN;
+        }
+    }
+    if (mpc_solve_status != 0)
+    {
+        /* Do not present an unsuccessful solve's iterate as a valid command. */
+        mpc_check_status = MPC_CHECK_SOLVER_FAILED;
+        mpc_check_done = 1;
+        return;
+    }
+    if (mpc_capsule == NULL || mpc_capsule->nlp_solver_plan->N != INTERACTION_MODEL_N)
+    {
+        mpc_check_status = MPC_CHECK_MODEL_CONFIG;
+        mpc_check_done = 1;
+        return;
+    }
+    for (int k = 0; k <= INTERACTION_MODEL_N; k++)
+    {
+        unsigned int stage_flags = 0U;
+        double x[INTERACTION_MODEL_NX];
+        double lbx[INTERACTION_MODEL_NX];
+        double ubx[INTERACTION_MODEL_NX];
+        int idxbx[INTERACTION_MODEL_NX];
+        ocp_nlp_out_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                        mpc_capsule->nlp_out, k, "x", x);
+        ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                        mpc_capsule->nlp_in, k, "lbx", lbx);
+        ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                        mpc_capsule->nlp_in, k, "ubx", ubx);
+        ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                        mpc_capsule->nlp_in, k, "idxbx", idxbx);
+        for (int j = 0; j < INTERACTION_MODEL_NX; j++)
+        {
+            mpc_x_pred[k][j] = x[j];
+            if (!isfinite(x[j])) stage_flags |= MPC_CHECK_NONFINITE;
+            if (idxbx[j] < 0 || idxbx[j] >= INTERACTION_MODEL_NX ||
+                !isfinite(lbx[j]) || !isfinite(ubx[j]) || lbx[j] > ubx[j])
+            {
+                stage_flags |= MPC_CHECK_MODEL_CONFIG;
+                if (k == 0) initial_fixed = 0;
+                continue;
+            }
+            if (k == 0 && lbx[j] != ubx[j]) initial_fixed = 0;
+            if (isfinite(x[idxbx[j]]))
+            {
+                double v = fmax(0.0, fmax(lbx[j] - x[idxbx[j]], x[idxbx[j]] - ubx[j]));
+                if (v > max_x_violation) max_x_violation = v;
+                if (v > MPC_BOUND_TOL) stage_flags |= MPC_CHECK_STATE_BOUNDS;
+            }
+        }
+        if (k < INTERACTION_MODEL_N)
+        {
+            double u[INTERACTION_MODEL_NU], lbu[INTERACTION_MODEL_NBU], ubu[INTERACTION_MODEL_NBU];
+            int idxbu[INTERACTION_MODEL_NBU];
+            ocp_nlp_out_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                            mpc_capsule->nlp_out, k, "u", u);
+            ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                            mpc_capsule->nlp_in, k, "lbu", lbu);
+            ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                            mpc_capsule->nlp_in, k, "ubu", ubu);
+            ocp_nlp_constraints_model_get(mpc_capsule->nlp_config, mpc_capsule->nlp_dims,
+                            mpc_capsule->nlp_in, k, "idxbu", idxbu);
+            mpc_u_pred[k] = u[0];
+            mpc_u_lower[k] = lbu[0];
+            mpc_u_upper[k] = ubu[0];
+            if (k == 0) mpc_u0 = u[0];
+            if (!isfinite(u[0])) stage_flags |= MPC_CHECK_NONFINITE;
+            if (idxbu[0] != 0 || !isfinite(lbu[0]) || !isfinite(ubu[0]) || lbu[0] > ubu[0])
+                stage_flags |= MPC_CHECK_MODEL_CONFIG;
+            else if (isfinite(u[0]))
+            {
+                double v = fmax(0.0, fmax(lbu[0] - u[0], u[0] - ubu[0]));
+                if (v > max_u_violation) max_u_violation = v;
+                if (v > MPC_BOUND_TOL) stage_flags |= MPC_CHECK_INPUT_BOUNDS;
+            }
+        }
+        if (stage_flags != 0U && first_bad < 0) first_bad = k;
+        flags |= stage_flags;
+    }
+    mpc_initial_state_fixed = initial_fixed;
+    mpc_max_u_violation = max_u_violation;
+    mpc_max_x_violation = max_x_violation;
+    mpc_first_bad_stage = first_bad;
+    mpc_check_status = (int)flags;
+    mpc_check_done = 1;
+}
+
+static void MPC_PrintDiagnostics(void)
+{
+    printf("\r\nMPC solve=%d check=%d (%s) first_bad_stage=%d\r\n",
+           (int)mpc_solve_status, (int)mpc_check_status,
+           mpc_check_status == 0 ? "NUMERIC_BOUNDS_PASS" : "FAIL",
+           (int)mpc_first_bad_stage);
+    printf("flags: solver=1 nonfinite=2 input_bounds=4 state_bounds=8 config=16\r\n");
+    if (mpc_solve_status == 0 && (mpc_check_status & MPC_CHECK_MODEL_CONFIG) == 0)
+    {
+        printf("u0=%.9f bounds=[%.9f, %.9f] max_u_violation=%.3e max_x_violation=%.3e\r\n",
+               (double)mpc_u0, (double)mpc_u_lower[0], (double)mpc_u_upper[0],
+               (double)mpc_max_u_violation, (double)mpc_max_x_violation);
+        for (int k = 0; k < INTERACTION_MODEL_N; k++)
+            printf("u[%d]=%.9f bounds=[%.9f, %.9f]\r\n", k,
+                   (double)mpc_u_pred[k], (double)mpc_u_lower[k], (double)mpc_u_upper[k]);
+        for (int k = 0; k <= INTERACTION_MODEL_N; k++)
+            printf("x[%d]=[%.9f, %.9f, %.9f, %.9f]\r\n", k,
+                   (double)mpc_x_pred[k][0], (double)mpc_x_pred[k][1],
+                   (double)mpc_x_pred[k][2], (double)mpc_x_pred[k][3]);
+        if (!mpc_initial_state_fixed)
+            printf("WARNING: x0 is a range, not fixed to a measured state.\r\n");
+    }
+    printf("Numeric/bound checks only; physical control suitability is not verified.\r\n");
 }
 
 /* USER CODE END 0 */
@@ -157,14 +325,12 @@ int main(void)
       Error_Handler();
   }
 
-  /* 古いFault情報をクリア */
-  *(volatile uint32_t *)0xE000EFA8 = 0xFFFFFFFFU; // ABFSR
-  *(volatile uint32_t *)0xE000ED28 = 0xFFFFFFFFU; // CFSR
-  *(volatile uint32_t *)0xE000ED2C = 0xFFFFFFFFU; // HFSR
-
   /* MPC最適化計算を1回実行 */
   mpc_solve_status =
       interaction_model_acados_solve(mpc_capsule);
+
+  MPC_CheckSolution();
+  MPC_PrintDiagnostics();
 
 
   /* USER CODE END 2 */
@@ -176,7 +342,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  printf("OK\n\r");
+	  /* Diagnostics are printed once after solve, without flooding UART. */
+      HAL_Delay(1000);
   }
   /* USER CODE END 3 */
 }
