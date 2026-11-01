@@ -24,7 +24,8 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <math.h>
-#include "acados_solver_interaction_model.h"
+#include "MPC_param.h"
+#include "MPC_function.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,35 +35,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 性能測定版：NUCLEO-F767ZI相当、HSE=8 MHz bypass、3.3 V動作を前提とする。
-   CubeIDEのMCU GCC Compiler / Optimizationを-O2にし、Clean Buildすること。
-   main.cだけの最適化では生成されたCasADi関数の-O0は解消しない。 */
-#ifndef MPC_CPU_216MHZ
-#define MPC_CPU_216MHZ 1
-#endif
-/* 1 ms運転中はUARTを止め、Expressionsで計測する。表示が必要な測定時だけ1へ。 */
-#ifndef MPC_ENABLE_UART_REPORT
-#define MPC_ENABLE_UART_REPORT 0
-#endif
-/* 今までのsin模擬入力を継続する。実センサを使うときは0にする。 */
-#ifndef MPC_USE_SINE_TEST
-#define MPC_USE_SINE_TEST 1
-#endif
-#define MPC_DEADLINE_US 1000U
-#if MPC_CPU_216MHZ
-_Static_assert(HSE_VALUE == 8000000U, "216 MHz configuration requires an 8 MHz HSE bypass input");
-#endif
-/* 意図的な待機は0。周期を保証するスケジューラではなく、処理時間をまず測定する。 */
-#define MPC_LOOP_DELAY_MS 0U
-/* UARTの連続出力で計算を妨げすぎないよう、通常は1秒ごとに表示する。 */
-#define MPC_REPORT_INTERVAL_MS 1000U
-/* 現在のモデルの入力制約。初期化後はMPC_UpdateInputBounds()でも変更できる。 */
-#define MPC_INPUT_MIN 0.0
-#define MPC_INPUT_MAX 10.0
-/* センサ4状態と、1入力・2段以上の予測入力を扱う現在のモデルに限定する。 */
-_Static_assert(INTERACTION_MODEL_NX == 4 && INTERACTION_MODEL_NU == 1 &&
-               INTERACTION_MODEL_NBX0 == 4 && INTERACTION_MODEL_NBU == 1 &&
-               INTERACTION_MODEL_N >= 2, "Update sensor interface for new model dimensions");
+/* MPC関連の初期設定はMPC_param.hで管理する。 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -100,19 +73,8 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 
-/* 起動時に作成したソルバと入出力を保持し、毎回のメモリ確保を避ける。 */
-static interaction_model_solver_capsule *mpc_capsule = NULL;
-static ocp_nlp_config *mpc_config = NULL;
-static ocp_nlp_dims *mpc_dims = NULL;
-static ocp_nlp_in *mpc_in = NULL;
-static ocp_nlp_out *mpc_out = NULL;
-static int mpc_state_pending = 0;
-/* Linux版と同様、前回成功時の入力列を次回の初期推定に使う。 */
-static int mpc_has_warm_start = 0;
-static double mpc_previous_u[INTERACTION_MODEL_N];
+/* 表示時刻とセンサ窓口はアプリケーション側で管理する。 */
 static uint32_t mpc_last_report_tick = 0U;
-/* UART無効時は制御開始後のライブラリ内部printfもブロックさせない。 */
-static volatile int mpc_control_running = 0;
 
 /* センサ側は4値を同じサンプルとして書き、最後にready=1を設定する。
    デバッガで試す場合も4値を書いてからsensor_sample_ready=1にする。
@@ -120,39 +82,7 @@ static volatile int mpc_control_running = 0;
 volatile double sensor_state[4] = {0.0, 0.0, 0.0, 0.0};
 volatile int sensor_sample_ready = 0;
 
-/* -999は未実行。センサ読取りは0=未着、1=取得、-1=非有限値。 */
-volatile int mpc_create_status = -999;
-volatile int mpc_sensor_status = 0;
-volatile int mpc_update_status = -999;
-volatile int mpc_step_status = -999;
-volatile int mpc_solve_status = -999;
-volatile uint32_t g_heap_peak_bytes = 0U;
-/* sample_countは取得したデータ数、iteration_countは実際のsolve回数。 */
-volatile uint32_t mpc_sample_count = 0U;
-volatile uint32_t mpc_iteration_count = 0U;
-volatile uint32_t mpc_success_count = 0U;
-volatile uint32_t mpc_failure_count = 0U;
-/* valid=1は直近の成功結果。新しいサンプルが来たという意味ではない。 */
-volatile int mpc_result_valid = 0;
-volatile uint32_t mpc_result_sample_id = 0U;
-volatile uint32_t mpc_solve_time_ms = 0U;
-/* DWTでソルバ単体と、状態更新から結果取得までを計測する。
-   割込みによる中断時間も含む。maxは起動後の初回・失敗時も含める。 */
-volatile uint32_t mpc_cpu_hz = 0U;
-volatile uint32_t mpc_icache_enabled = 0U;
-volatile uint32_t mpc_cycle_counter_enabled = 0U;
-volatile uint32_t mpc_solve_us = 0U;
-volatile uint32_t mpc_solve_us_max = 0U;
-volatile uint32_t mpc_control_us = 0U;
-volatile uint32_t mpc_control_us_max = 0U;
-volatile uint32_t mpc_deadline_misses = 0U;
-volatile double mpc_input_lower = MPC_INPUT_MIN;
-volatile double mpc_input_upper = MPC_INPUT_MAX;
-/* measured_xは実測入力、x0はソルバ出力。両者を混同しない。 */
-volatile double mpc_measured_x[4] = {NAN, NAN, NAN, NAN};
-volatile double mpc_x0[4] = {NAN, NAN, NAN, NAN};
-volatile double mpc_u0 = NAN;
-volatile double mpc_u1 = NAN;
+/* MPCの共有変数はMPC_param.cで定義し、MPC_param.hから参照する。 */
 
 /* USER CODE END PV */
 
@@ -164,21 +94,9 @@ static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
-/* センサ取得、初期化、制約更新、計算実行、表示の役割を関数で分離する。 */
-static void CPU_EnableInstructionCache(void);
-static void MPC_InitCycleCounter(void);
-static uint32_t MPC_CyclesToUs(uint32_t cycles);
-static void MPC_RecordControlTime(uint32_t start_cycles);
+/* ボード側のセンサ取得とUART表示だけをmain.cに残す。 */
 static int Sensors_ReadState(double state[4]);
-static int MPC_Init(void);
-static void MPC_InvalidateResult(void);
-static int MPC_UpdateInitialState(const double measured_state[4]);
-static int MPC_UpdateInputBounds(double lower, double upper);
-static void MPC_PrepareWarmStart(void);
-static int MPC_Execute(void);
-#if MPC_ENABLE_UART_REPORT
 static void MPC_PrintResult(void);
-#endif
 
 /* USER CODE END PFP */
 
@@ -191,55 +109,10 @@ static void MPC_PrintResult(void);
 #endif
 PUTCHAR_PROTOTYPE
 {
-#if !MPC_ENABLE_UART_REPORT
-    /* 初期化メッセージだけ出力し、制御中はprintf文字を送信せずに戻す。 */
-    if (mpc_control_running) return ch;
-#endif
 	HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xFFFF);
 	return ch;
 }
 
-
-/* 命令キャッシュだけを有効化する。DMAバッファの整合性に影響するD-cacheは変更しない。 */
-static void CPU_EnableInstructionCache(void)
-{
-    if ((SCB->CCR & SCB_CCR_IC_Msk) == 0U) SCB_EnableICache();
-    mpc_icache_enabled = (SCB->CCR & SCB_CCR_IC_Msk) != 0U;
-}
-
-/* 1 ms粒度のHAL_GetTickと別に、CPUサイクルカウンタを起動する。 */
-static void MPC_InitCycleCounter(void)
-{
-    mpc_cpu_hz = HAL_RCC_GetHCLKFreq();
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->LAR = 0xC5ACCE55U;
-    DWT->CYCCNT = 0U;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    __DSB();
-    __ISB();
-    uint32_t probe_before = DWT->CYCCNT;
-    for (volatile uint32_t probe = 0U; probe < 16U; probe++) __NOP();
-    uint32_t probe_after = DWT->CYCCNT;
-    mpc_cycle_counter_enabled = ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U &&
-                               (DWT->CTRL & DWT_CTRL_NOCYCCNT_Msk) == 0U &&
-                               probe_after != probe_before);
-}
-
-/* マイクロ秒に切り上げる。計測1回はCYCCNTの周回時間より短いことが前提。 */
-static uint32_t MPC_CyclesToUs(uint32_t cycles)
-{
-    if (!mpc_cycle_counter_enabled || mpc_cpu_hz == 0U) return 0U;
-    return (uint32_t)(((uint64_t)cycles * 1000000ULL + mpc_cpu_hz - 1U) / mpc_cpu_hz);
-}
-
-/* 制約更新・ウォームスタート・solve・結果取得の合計と、1 ms超過回数を記録する。
-   UART表示はこの計測範囲外。実制御では表示を無効にして周期全体も測定する。 */
-static void MPC_RecordControlTime(uint32_t start_cycles)
-{
-    mpc_control_us = MPC_CyclesToUs(DWT->CYCCNT - start_cycles);
-    if (mpc_control_us > mpc_control_us_max) mpc_control_us_max = mpc_control_us;
-    if (mpc_control_us > MPC_DEADLINE_US) mpc_deadline_misses++;
-}
 
 /* センサが用意した4状態を、割込みによる書き換えから保護してコピーする。
    センサ側の同一割込みで4値を書き、最後にready=1とする運用を想定する。
@@ -265,203 +138,10 @@ static int Sensors_ReadState(double state[4])
     return 1;
 }
 
-/* 前回の結果を無効化し、失敗後に古い入力を今回の結果として使わせない。 */
-static void MPC_InvalidateResult(void)
-{
-    mpc_result_valid = 0;
-    mpc_u0 = NAN;
-    mpc_u1 = NAN;
-    mpc_solve_time_ms = 0U;
-    mpc_solve_us = 0U;
-    for (int i = 0; i < 4; i++) mpc_x0[i] = NAN;
-}
-
-/* カプセル、計算領域、モデルを一度だけ作成する。制約値更新は別関数で行う。 */
-static int MPC_Init(void)
-{
-    if (mpc_capsule != NULL) return mpc_create_status;
-    mpc_capsule = interaction_model_acados_create_capsule();
-    if (mpc_capsule == NULL)
-    {
-        mpc_create_status = -1;
-        return mpc_create_status;
-    }
-    mpc_create_status = interaction_model_acados_create(mpc_capsule);
-    if (mpc_create_status != 0) return mpc_create_status;
-
-    /* 制約更新にはin、計算結果の取得にはoutを使う。 */
-    mpc_config = interaction_model_acados_get_nlp_config(mpc_capsule);
-    mpc_dims = interaction_model_acados_get_nlp_dims(mpc_capsule);
-    mpc_in = interaction_model_acados_get_nlp_in(mpc_capsule);
-    mpc_out = interaction_model_acados_get_nlp_out(mpc_capsule);
-    if (mpc_config == NULL || mpc_dims == NULL || mpc_in == NULL || mpc_out == NULL)
-    {
-        mpc_create_status = -2;
-        return mpc_create_status;
-    }
-
-    /* stage 0の制約の順番をセンサのx[0],x[1],x[2],x[3]に対応させる。 */
-    int idxbx[4] = {0, 1, 2, 3};
-    mpc_create_status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                          mpc_in, mpc_out, 0, "idxbx", idxbx);
-    return mpc_create_status;
-}
-
-/* 実測状態を初期状態の等式として設定する：lbx[0]=ubx[0]=実測の4状態。
-   stage 1以降と終端の状態制約は、生成されたモデルの設定を維持する。 */
-static int MPC_UpdateInitialState(const double measured_state[4])
-{
-    mpc_state_pending = 0;
-    MPC_InvalidateResult();
-    mpc_solve_status = -999;
-    mpc_update_status = -999;
-    if (mpc_create_status != 0 || mpc_capsule == NULL)
-        return (mpc_update_status = -1);
-    if (measured_state == NULL) return (mpc_update_status = -2);
-
-    /* 4値すべてを検査してから制約を変更し、NaN/Infや途中更新を避ける。 */
-    double state[4];
-    for (int i = 0; i < 4; i++)
-    {
-        if (!isfinite(measured_state[i])) return (mpc_update_status = -2);
-        state[i] = measured_state[i];
-    }
-    mpc_update_status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                                mpc_in, mpc_out, 0, "lbx", state);
-    if (mpc_update_status != 0) return mpc_update_status;
-    mpc_update_status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                                mpc_in, mpc_out, 0, "ubx", state);
-    if (mpc_update_status != 0) return mpc_update_status;
-
-    /* 初期状態の初期推定値も測定値に合わせる。予測系列全体は再生成しない。 */
-    ocp_nlp_out_set(mpc_config, mpc_dims, mpc_out, mpc_in, 0, "x", state);
-    for (int i = 0; i < 4; i++) mpc_measured_x[i] = state[i];
-    mpc_state_pending = 1;
-    return 0;
-}
-
-/* 入力の上下限を全予測入力へ設定する。起動時か、制約が変わったときに呼ぶ。
-   1入力の現在のモデルが対象。更新はmainから行い、solveと同時に呼ばない。 */
-static int MPC_UpdateInputBounds(double lower, double upper)
-{
-    if (mpc_create_status != 0 || mpc_capsule == NULL) return -1;
-    if (!isfinite(lower) || !isfinite(upper) || lower > upper) return -2;
-    /* 有効な制約変更でも、変更前の計算結果・未実行状態入力は使い回さない。 */
-    mpc_state_pending = 0;
-    mpc_has_warm_start = 0;
-    MPC_InvalidateResult();
-    int idxbu[1] = {0};
-    for (int k = 0; k < INTERACTION_MODEL_N; k++)
-    {
-        int status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                                      mpc_in, mpc_out, k, "idxbu", idxbu);
-        if (status != 0) return status;
-        status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                                      mpc_in, mpc_out, k, "lbu", &lower);
-        if (status != 0) return status;
-        status = ocp_nlp_constraints_model_set(mpc_config, mpc_dims,
-                                      mpc_in, mpc_out, k, "ubu", &upper);
-        if (status != 0) return status;
-    }
-    mpc_input_lower = lower;
-    mpc_input_upper = upper;
-    return 0;
-}
-
-/* 初期推定を準備する。初回・失敗後は全予測状態を今回の測定値で初期化する。
-   元の生成コードの極端な推定値x[3]=-100000を残したまま計算しない。
-   成功後はLinux版と同じく前回入力列を1段ずらし、最後の入力は維持する。 */
-static void MPC_PrepareWarmStart(void)
-{
-    /* 制約変更・失敗後は双対変数とQP内部状態もリセットする。
-       引数0により、更新した制約・モデル値・オプションは保持する。 */
-    if (!mpc_has_warm_start)
-        interaction_model_acados_reset(mpc_capsule, 1, 0, 0, 0);
-    for (int k = 0; k < INTERACTION_MODEL_N; k++)
-    {
-        double guess = mpc_has_warm_start
-                       ? mpc_previous_u[k + 1 < INTERACTION_MODEL_N ? k + 1 : k]
-                       : fmax((double)mpc_input_lower, fmin((double)mpc_input_upper, 0.0));
-        ocp_nlp_out_set(mpc_config, mpc_dims, mpc_out, mpc_in, k, "u", &guess);
-    }
-    if (!mpc_has_warm_start)
-    {
-        double state[4];
-        for (int i = 0; i < 4; i++) state[i] = mpc_measured_x[i];
-        for (int k = 0; k <= INTERACTION_MODEL_N; k++)
-            ocp_nlp_out_set(mpc_config, mpc_dims, mpc_out, mpc_in, k, "x", state);
-    }
-}
-
-/* 今回の測定値で制約更新した後に、一度だけsolveを実行して結果を保存する。
-   戻り値0=成功、正の値=acadosの失敗コード、負の値=入力/出力処理の失敗。 */
-static int MPC_Execute(void)
-{
-    MPC_InvalidateResult();
-    mpc_solve_status = -999;
-    if (mpc_create_status != 0 || mpc_capsule == NULL)
-        return (mpc_step_status = -1);
-    if (!mpc_state_pending) return (mpc_step_status = -3);
-    /* 同じ状態入力を、更新なしで再び計算に使わない。 */
-    mpc_state_pending = 0;
-    /* 予測値の準備は制約を変更する処理とは分けて行う。 */
-    MPC_PrepareWarmStart();
-    uint32_t start_tick = HAL_GetTick();
-    uint32_t start_cycles = DWT->CYCCNT;
-    mpc_solve_status = interaction_model_acados_solve(mpc_capsule);
-    uint32_t end_cycles = DWT->CYCCNT;
-    mpc_solve_time_ms = HAL_GetTick() - start_tick;
-    mpc_solve_us = MPC_CyclesToUs(end_cycles - start_cycles);
-    if (mpc_solve_us > mpc_solve_us_max) mpc_solve_us_max = mpc_solve_us;
-    mpc_iteration_count++;
-    if (mpc_solve_status != 0)
-    {
-        mpc_failure_count++;
-        mpc_has_warm_start = 0;
-        return (mpc_step_status = mpc_solve_status);
-    }
-
-    /* 今回の制御入力、次段の予測入力、固定された初期状態の出力を取得する。 */
-    double u0[1], u1[1], x0[4];
-    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 0, "u", u0);
-    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 1, "u", u1);
-    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 0, "x", x0);
-    int finite_result = isfinite(u0[0]) && isfinite(u1[0]);
-    for (int i = 0; i < 4; i++) finite_result = finite_result && isfinite(x0[i]);
-    /* 次回用に全入力列を取得し、非有限値の列はウォームスタートに使わない。 */
-    double sequence[INTERACTION_MODEL_N];
-    for (int k = 0; k < INTERACTION_MODEL_N; k++)
-    {
-        ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, k, "u", &sequence[k]);
-        finite_result = finite_result && isfinite(sequence[k]);
-    }
-    if (!finite_result)
-    {
-        mpc_failure_count++;
-        mpc_has_warm_start = 0;
-        return (mpc_step_status = -4);
-    }
-    mpc_u0 = u0[0];
-    mpc_u1 = u1[0];
-    for (int i = 0; i < 4; i++) mpc_x0[i] = x0[i];
-    mpc_result_sample_id = mpc_sample_count;
-    for (int k = 0; k < INTERACTION_MODEL_N; k++) mpc_previous_u[k] = sequence[k];
-    mpc_has_warm_start = 1;
-    mpc_success_count++;
-    mpc_result_valid = 1;
-    return (mpc_step_status = 0);
-}
-
-#if MPC_ENABLE_UART_REPORT
 /* センサ入力とソルバ出力を区別してUARTへ表示する。 */
 static void MPC_PrintResult(void)
 {
     printf("\r\n========== Sensor MPC ==========\r\n");
-    printf("hclk=%lu icache=%lu dwt=%lu solve_us=%lu max=%lu control_us=%lu max=%lu misses_1ms=%lu\r\n",
-           (unsigned long)mpc_cpu_hz, (unsigned long)mpc_icache_enabled,
-           (unsigned long)mpc_cycle_counter_enabled, (unsigned long)mpc_solve_us,
-           (unsigned long)mpc_solve_us_max, (unsigned long)mpc_control_us,
-           (unsigned long)mpc_control_us_max, (unsigned long)mpc_deadline_misses);
     printf("samples=%lu solves=%lu success=%lu failure=%lu\r\n",
            (unsigned long)mpc_sample_count, (unsigned long)mpc_iteration_count,
            (unsigned long)mpc_success_count, (unsigned long)mpc_failure_count);
@@ -482,8 +162,6 @@ static void MPC_PrintResult(void)
     printf("================================\r\n");
 }
 
-#endif /* MPC_ENABLE_UART_REPORT */
-
 /* USER CODE END 0 */
 
 /**
@@ -494,8 +172,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  /* 初期化前にI-cacheを有効化し、Flash上の命令取得を高速化する。 */
-  CPU_EnableInstructionCache();
 
   /* USER CODE END 1 */
 
@@ -512,8 +188,6 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  /* 最終クロック設定後のHCLKを使ってDWT計時を初期化する。 */
-  MPC_InitCycleCounter();
 
   /* USER CODE END SysInit */
 
@@ -524,6 +198,8 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
+  /* HALのms時計を登録する。MPC本体はHALヘッダを必要としない。 */
+  MPC_SetTickProvider(HAL_GetTick);
   /* ソルバの初期化と、起動時の入力制約更新を一度だけ実行する。 */
   if (MPC_Init() != 0)
   {
@@ -537,11 +213,7 @@ int main(void)
       Error_Handler();
   }
   printf("MPC initialized. Waiting for sensor_state[4] and sensor_sample_ready=1.\r\n");
-  printf("Performance: HCLK=%lu Hz ICache=%lu DWT=%lu UART_REPORT=%d. Watch mpc_solve_us / mpc_control_us_max.\r\n",
-         (unsigned long)mpc_cpu_hz, (unsigned long)mpc_icache_enabled,
-         (unsigned long)mpc_cycle_counter_enabled, MPC_ENABLE_UART_REPORT);
   mpc_last_report_tick = HAL_GetTick();
-  mpc_control_running = 1;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -551,18 +223,24 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-      uint32_t control_start_cycles = DWT->CYCCNT;
-#if MPC_USE_SINE_TEST
-      /* 最新の動作確認例と同じ、状態1/2のsin波と状態3=1、状態4=100を入力する。 */
-      double t_s = (double)HAL_GetTick() * 0.001;
-      double wave = 0.1 * sin(2.0 * 3.141592653589793 * 0.5 * t_s);
-      sensor_state[0] = wave;
-      sensor_state[1] = wave;
-      sensor_state[2] = 1.0;
-      sensor_state[3] = 100.0;
-      sensor_sample_ready = 1;
-#endif
       /* 1. センサから今回の4状態を受け取る。未着ならsolveせずに待つ。 */
+	  /* 動作確認用：経過時間からsin波の模擬センサ値を作る。 */
+	  const double amplitude = 0.5;
+	  const double frequency_hz = 0.5;
+	  const double time_s = (double)HAL_GetTick() * 0.001;
+	  const double sine_value =
+	      amplitude * sin(2.0 * 3.141592653589793 * frequency_hz * time_s);
+
+	  /* 状態1・2にsin波、状態3に1、状態4に100を設定する。 */
+	  sensor_state[0] = sine_value;  /* 状態1 */
+	  sensor_state[1] = sine_value;  /* 状態2 */
+	  sensor_state[2] = 1.0;         /* 状態3 */
+	  sensor_state[3] = 100.0;       /* 状態4 */
+
+	  /* 4状態を書き終えてから、新しいサンプルがあることを通知する。 */
+	  sensor_sample_ready = 1;
+
+	  /* この下に、既存の読み取り・制約更新・MPC実行処理を残す。 */
       double measured_state[4];
       mpc_sensor_status = Sensors_ReadState(measured_state);
       if (mpc_sensor_status == 1)
@@ -594,18 +272,13 @@ int main(void)
       else if (mpc_sensor_status < 0)
       {
           /* 不正なセンサ値では計算せず、前回の入力も無効にする。 */
-          mpc_state_pending = 0;
-          mpc_has_warm_start = 0;
-          MPC_InvalidateResult();
+          MPC_DiscardState();
           mpc_update_status = -2;
           mpc_solve_status = -999;
           mpc_step_status = -2;
           mpc_failure_count++;
       }
 
-      if (mpc_sensor_status != 0) MPC_RecordControlTime(control_start_cycles);
-
-#if MPC_ENABLE_UART_REPORT
       /* 5. 初回のサンプル処理と、それ以後は約1秒ごとに状態を表示する。 */
       if ((mpc_sensor_status == 1 && mpc_sample_count == 1U) ||
           (uint32_t)(HAL_GetTick() - mpc_last_report_tick) >= MPC_REPORT_INTERVAL_MS)
@@ -613,11 +286,8 @@ int main(void)
           MPC_PrintResult();
           mpc_last_report_tick = HAL_GetTick();
       }
-#endif
-      /* 待機0でもHAL_Delay(0)は1 tick待つ実装があるので、関数自体を呼ばない。 */
-#if MPC_LOOP_DELAY_MS > 0U
+      /* 6. 動作確認用の待機。計算時間も加わるため、厳密な1 ms周期ではない。 */
       HAL_Delay(MPC_LOOP_DELAY_MS);
-#endif
   }
   /* USER CODE END 3 */
 }
@@ -638,11 +308,7 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
-#if MPC_CPU_216MHZ
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-#else
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-#endif
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -652,18 +318,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 4;
-#if MPC_CPU_216MHZ
-  /* 8 MHz / 4 * 216 / 2 = 216 MHz、USB用Q出力は432 / 9 = 48 MHz。 */
-  RCC_OscInitStruct.PLL.PLLN = 216;
-#else
   RCC_OscInitStruct.PLL.PLLN = 96;
-#endif
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-#if MPC_CPU_216MHZ
-  RCC_OscInitStruct.PLL.PLLQ = 9;
-#else
   RCC_OscInitStruct.PLL.PLLQ = 4;
-#endif
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -683,20 +340,10 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-#if MPC_CPU_216MHZ
-  /* F767のAPB1/APB2の上限に合わせ、54 MHz/108 MHzにする。 */
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
-#else
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-#endif
 
-#if MPC_CPU_216MHZ
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
-#else
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-#endif
   {
     Error_Handler();
   }
@@ -769,9 +416,7 @@ static void MX_TIM7_Init(void)
 
   /* USER CODE END TIM7_Init 1 */
   htim7.Instance = TIM7;
-  /* このクロック設定ではAPB1分周>1、TIMPRE=0なのでTIM7の入力はPCLK1*2。 */
-  __HAL_RCC_TIMCLKPRESCALER(RCC_TIMPRES_DESACTIVATED);
-  htim7.Init.Prescaler = (HAL_RCC_GetPCLK1Freq() * 2U) / 1000000U - 1U;
+  htim7.Init.Prescaler = 96-1;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim7.Init.Period = 1000-1;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
