@@ -1,0 +1,290 @@
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -23,6 +23,7 @@
+ /* Private includes ----------------------------------------------------------*/
+ /* USER CODE BEGIN Includes */
+ #include <stdio.h>
++#include <math.h>
+ #include "acados_solver_interaction_model.h"
+ /* USER CODE END Includes */
+ 
+@@ -33,6 +34,13 @@
+ 
+ /* Private define ------------------------------------------------------------*/
+ /* USER CODE BEGIN PD */
++/* 計算終了後の待ち時間。計算・UART出力の時間も加わるため、厳密な1 ms周期ではない。 */
++#define MPC_LOOP_DELAY_MS 1U
++/* UARTの連続出力で計算を妨げすぎないよう、通常は1秒ごとに表示する。 */
++#define MPC_REPORT_INTERVAL_MS 1000U
++/* このコードは入力1個、状態4個、予測区間2個以上の現在のモデルを対象とする。 */
++_Static_assert(INTERACTION_MODEL_NU == 1 && INTERACTION_MODEL_NX == 4 &&
++               INTERACTION_MODEL_N >= 2, "Update result buffers for the new model");
+ 
+ /* USER CODE END PD */
+ 
+@@ -71,14 +79,29 @@
+ 
+ /* USER CODE BEGIN PV */
+ 
++/* ソルバ本体とアクセス用ポインタを保持し、while内で再生成しない。 */
+ static interaction_model_solver_capsule *mpc_capsule = NULL;
+-
++static ocp_nlp_config *mpc_config = NULL;
++static ocp_nlp_dims *mpc_dims = NULL;
++static ocp_nlp_out *mpc_out = NULL;
++static uint32_t mpc_last_report_tick = 0U;
++
++/* 初期化と直近の計算の戻り値。-999は未実行を表す。 */
+ volatile int mpc_create_status = -999;
+ volatile int mpc_solve_status = -999;
+ volatile uint32_t g_heap_peak_bytes = 0U;
+-volatile double mpc_u0 = -999.0;
+-volatile double mpc_u1 = -999.0;
+-volatile double mpc_x0[4] = {0};
++/* デバッガのExpressionsで計算回数・失敗回数・最新出力の有効性を確認する。 */
++volatile uint32_t mpc_iteration_count = 0U;
++volatile uint32_t mpc_success_count = 0U;
++volatile uint32_t mpc_failure_count = 0U;
++volatile int mpc_result_valid = 0;
++/* HAL_GetTickによる粗い計算時間。1 ms未満は0になることがある。 */
++volatile uint32_t mpc_solve_time_ms = 0U;
++/* u0は今回使う最初の入力、u1は次の予測ステップの入力。別々の入力軸ではない。 */
++volatile double mpc_u0 = NAN;
++volatile double mpc_u1 = NAN;
++/* ソルバのstage 0の状態。センサから読み取った実測状態ではない。 */
++volatile double mpc_x0[INTERACTION_MODEL_NX] = {NAN, NAN, NAN, NAN};
+ 
+ /* USER CODE END PV */
+ 
+@@ -90,6 +113,10 @@
+ static void MX_USB_OTG_FS_PCD_Init(void);
+ static void MX_TIM7_Init(void);
+ /* USER CODE BEGIN PFP */
++/* 初期化・1回分の計算・UART表示を分け、実行する場所を明確にする。 */
++static int MPC_Init(void);
++static void MPC_RunOnce(void);
++static void MPC_PrintResult(void);
+ 
+ /* USER CODE END PFP */
+ 
+@@ -106,6 +133,115 @@
+ 	return ch;
+ }
+ 
++
++/* ソルバのメモリ確保・モデル初期化・ポインタ取得を起動時に一度だけ行う。 */
++static int MPC_Init(void)
++{
++    /* 誤って複数回呼ばれても、カプセルを再生成してメモリを失わない。 */
++    if (mpc_capsule != NULL)
++        return mpc_create_status;
++
++    /* カプセルを確保し、確保できなければ呼び出し元に失敗を返す。 */
++    mpc_capsule = interaction_model_acados_create_capsule();
++    if (mpc_capsule == NULL)
++    {
++        mpc_create_status = -1;
++        return mpc_create_status;
++    }
++
++    /* acadosのモデル、制約、計算用メモリを一度だけ構築する。 */
++    mpc_create_status = interaction_model_acados_create(mpc_capsule);
++    if (mpc_create_status != 0)
++        return mpc_create_status;
++
++    /* ループで結果を取得するときに使うポインタを保存する。 */
++    mpc_config = interaction_model_acados_get_nlp_config(mpc_capsule);
++    mpc_dims = interaction_model_acados_get_nlp_dims(mpc_capsule);
++    mpc_out = interaction_model_acados_get_nlp_out(mpc_capsule);
++    if (mpc_config == NULL || mpc_dims == NULL || mpc_out == NULL)
++    {
++        mpc_create_status = -2;
++        return mpc_create_status;
++    }
++    return 0;
++}
++
++/* 確保済みのソルバを再利用し、現在の設定から制御入力を1回計算する。 */
++static void MPC_RunOnce(void)
++{
++    /* 前回の入力を今回の成功結果と取り違えないよう、計算前に無効化する。 */
++    mpc_result_valid = 0;
++    mpc_u0 = NAN;
++    mpc_u1 = NAN;
++    for (int i = 0; i < INTERACTION_MODEL_NX; i++)
++        mpc_x0[i] = NAN;
++
++    /* 初期化成功を確認してから、同じカプセルでsolveを呼ぶ。 */
++    if (mpc_create_status != 0 || mpc_capsule == NULL)
++    {
++        mpc_solve_status = -998;
++        return;
++    }
++    uint32_t start_tick = HAL_GetTick();
++    mpc_solve_status = interaction_model_acados_solve(mpc_capsule);
++    mpc_solve_time_ms = HAL_GetTick() - start_tick;
++    mpc_iteration_count++;
++
++    /* 計算失敗時は古い結果を再利用せず、失敗回数を記録して次のループへ戻る。 */
++    if (mpc_solve_status != 0)
++    {
++        mpc_failure_count++;
++        return;
++    }
++
++    /* stage 0とstage 1の入力、およびstage 0の状態をローカル変数に取得する。 */
++    double u0[INTERACTION_MODEL_NU] = {0};
++    double u1[INTERACTION_MODEL_NU] = {0};
++    double x0[INTERACTION_MODEL_NX] = {0};
++    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 0, "u", u0);
++    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 1, "u", u1);
++    ocp_nlp_out_get(mpc_config, mpc_dims, mpc_out, 0, "x", x0);
++
++    /* 戻り値が0でもNaN/Infが含まれる場合は、有効な出力として公開しない。 */
++    int finite_result = isfinite(u0[0]) && isfinite(u1[0]);
++    for (int i = 0; i < INTERACTION_MODEL_NX; i++)
++        finite_result = finite_result && isfinite(x0[i]);
++    if (!finite_result)
++    {
++        mpc_failure_count++;
++        return;
++    }
++
++    /* 検査を通った値をExpressionsと後段の制御処理で参照できる変数に保存する。 */
++    mpc_u0 = u0[0];
++    mpc_u1 = u1[0];
++    for (int i = 0; i < INTERACTION_MODEL_NX; i++)
++        mpc_x0[i] = x0[i];
++    mpc_success_count++;
++    mpc_result_valid = 1;
++}
++
++/* 最新の計算状態と取得した入力・状態をUARTへ表示する。表示中は計算が止まる。 */
++static void MPC_PrintResult(void)
++{
++    printf("\r\n========== MPC Result ==========\r\n");
++    printf("iteration=%lu success=%lu failure=%lu\r\n",
++           (unsigned long)mpc_iteration_count, (unsigned long)mpc_success_count,
++           (unsigned long)mpc_failure_count);
++    printf("MPC solve status = %d, result_valid = %d, solve_ms = %lu\r\n",
++           (int)mpc_solve_status, (int)mpc_result_valid, (unsigned long)mpc_solve_time_ms);
++    if (mpc_result_valid)
++    {
++        printf("mpc_u0 = %.10f\r\n", (double)mpc_u0);
++        printf("mpc_u1 = %.10f\r\n", (double)mpc_u1);
++        for (int i = 0; i < INTERACTION_MODEL_NX; i++)
++            printf("mpc_x0[%d] = %.10f\r\n", i, (double)mpc_x0[i]);
++    }
++    else
++        printf("No valid result: previous outputs were invalidated.\r\n");
++    printf("================================\r\n");
++}
++
+ /* USER CODE END 0 */
+ 
+ /**
+@@ -142,70 +278,14 @@
+   MX_USB_OTG_FS_PCD_Init();
+   MX_TIM7_Init();
+   /* USER CODE BEGIN 2 */
+-  /* 1. Create acados solver capsule */
+-  mpc_capsule = interaction_model_acados_create_capsule();
+-
+-  if (mpc_capsule == NULL)
+-  {
+-	  printf("Error: Failed to create acados capsule.\r\n");
+-      mpc_create_status = -1;
++  /* 起動時の初期化：ソルバを一度だけ作成し、失敗したら計算ループに入らない。 */
++  if (MPC_Init() != 0)
++  {
++      printf("Error: MPC initialization failed: %d\r\n", (int)mpc_create_status);
+       Error_Handler();
+   }
+-
+-  /* 2. Create MPC solver */
+-  mpc_create_status = interaction_model_acados_create(mpc_capsule);
+-
+-  if (mpc_create_status != 0)
+-  {
+-	  printf("Error: interaction_model_acados_create failed: %d\n", mpc_create_status);
+-      Error_Handler();
+-  }
+-
+-  /* MPC最適化計算を1回実行 */
+-  mpc_solve_status =
+-      interaction_model_acados_solve(mpc_capsule);
+-
+-  printf("MPC solve status = %d\r\n", mpc_solve_status);
+-
+-  if (mpc_solve_status == 0)
+-  {
+-      ocp_nlp_config *config =interaction_model_acados_get_nlp_config(mpc_capsule);
+-
+-      ocp_nlp_dims *dims =interaction_model_acados_get_nlp_dims(mpc_capsule);
+-
+-      ocp_nlp_out *out =interaction_model_acados_get_nlp_out(mpc_capsule);
+-
+-      double u0[1] = {0};
+-      double u1[1] = {0};
+-      double x0[4] = {0};
+-
+-      /* MPC制御入力取得 */
+-      ocp_nlp_out_get(config, dims, out, 0, "u", u0);
+-      ocp_nlp_out_get(config, dims, out, 1, "u", u1);
+-
+-      /* MPC状態取得 */
+-      ocp_nlp_out_get(config, dims, out, 0, "x", x0);
+-
+-      /* 結果表示 */
+-      printf("========== MPC Result ==========\r\n");
+-
+-      printf("mpc_u0 = %.10f\r\n", u0[0]);
+-      printf("mpc_u1 = %.10f\r\n", u1[0]);
+-
+-      printf("mpc_x0[0] = %.10f\r\n", x0[0]);
+-      printf("mpc_x0[1] = %.10f\r\n", x0[1]);
+-      printf("mpc_x0[2] = %.10f\r\n", x0[2]);
+-      printf("mpc_x0[3] = %.10f\r\n", x0[3]);
+-
+-      printf("================================\r\n");
+-  }
+-  else
+-  {
+-      printf("MPC solve failed: %d\r\n", mpc_solve_status);
+-  }
+-
+-
+-
++  /* 通常の結果表示を1秒ごとに制限するため、表示時刻を初期化する。 */
++  mpc_last_report_tick = HAL_GetTick();
+   /* USER CODE END 2 */
+ 
+   /* Infinite loop */
+@@ -215,7 +295,26 @@
+     /* USER CODE END WHILE */
+ 
+     /* USER CODE BEGIN 3 */
+-	  //printf("%lf \n\r",mpc_u0);
++      /* 1. 実測状態を使う場合は、ここでセンサを読み、stage 0のlbx/ubxを更新する。
++         現在はセンサ仕様が未定なので、生成済みモデルの初期状態範囲を維持する。
++         ソルバが求めたmpc_x0を実測状態と見なして戻してはいけない。 */
++
++      /* 2. 起動時に作成したソルバで毎ループ計算し、mpc_u0/mpc_u1/mpc_x0を更新する。 */
++      MPC_RunOnce();
++
++      /* 3. 実機に入力する処理を追加する場合は、mpc_result_validを確認してからu0を使う。
++         今回はアクチュエータへの出力処理は行わない。 */
++
++      /* 4. 最初の結果と、その後は1秒ごとの結果をUARTへ表示する。 */
++      if (mpc_iteration_count == 1U ||
++          (uint32_t)(HAL_GetTick() - mpc_last_report_tick) >= MPC_REPORT_INTERVAL_MS)
++      {
++          MPC_PrintResult();
++          mpc_last_report_tick = HAL_GetTick();
++      }
++
++      /* 5. 動作確認用に計算後1 ms待つ。実際の周期は計算・表示時間の分だけ長くなる。 */
++      HAL_Delay(MPC_LOOP_DELAY_MS);
+   }
+   /* USER CODE END 3 */
+ }
