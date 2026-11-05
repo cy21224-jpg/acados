@@ -4,7 +4,7 @@
 生成コマンド: python DRL_EKF_MPFC_for_3link_3.py
 生成後のupdate_acados.py --check / 通常更新は既存の手順を使用する。
 位置0が接触面、押し込む方向が正という前提。剛性の符号は変更しない。
-負位置静止では力追従コストの勾配が0になり、接近動作は生成されない場合がある。
+負位置でのみ接近コストを追加した試験用。実機の入力符号・挙動確認後に評価する。
 接触境界は非滑らかであり、SQP_RTIのstatus=0でも非線形予測残差が残り得る。
 """
 
@@ -37,9 +37,11 @@ class DRL_EKF_func_series:
         # 評価関数の重み
         # =================================
 
-        # 接触力・釣り合いの重み。位置・速度の目標追従は評価しない。
+        # 接触中の力追従と、非接触時だけの接近を評価する。
         self.force_ref = 1.0
         self.q_force = 1
+        self.q_gap = 100.0  # 非接触時の接近コスト（試験値、位置の単位はm）
+        self.q_gap_terminal = 0.02 * self.q_gap
         self.q_balance = 0.01
         self.q_force_terminal = 0.02
         self.R = casadi.DM.eye(self.nu) * 0.1
@@ -214,24 +216,25 @@ class DRL_EKF_func_series:
         x = ocp.model.x
         u = ocp.model.u
         f_env = self.environment_reaction(x[1], x[2])
-        outputs = casadi.vertcat(f_env, u[0] - f_env, u[0])
+        gap = casadi.if_else(x[1] < 0.0, x[1], 0.0)
+        outputs = casadi.vertcat(f_env, u[0] - f_env, u[0], gap)
 
         ocp.model.cost_y_expr_0 = outputs
         ocp.model.cost_y_expr = outputs
-        ocp.model.cost_y_expr_e = casadi.vertcat(f_env)
+        ocp.model.cost_y_expr_e = casadi.vertcat(f_env, gap)
 
         W = np.diag([
-            self.q_force, self.q_balance, float(self.R[0, 0])
+            self.q_force, self.q_balance, float(self.R[0, 0]), self.q_gap
         ])
         yref = np.array([
-            self.force_ref, 0.0, float(self.u_ref[0])
+            self.force_ref, 0.0, float(self.u_ref[0]), 0.0
         ])
         ocp.cost.W_0 = W.copy()
         ocp.cost.W = W.copy()
-        ocp.cost.W_e = np.array([[self.q_force_terminal]])
+        ocp.cost.W_e = np.diag([self.q_force_terminal, self.q_gap_terminal])
         ocp.cost.yref_0 = yref.copy()
         ocp.cost.yref = yref.copy()
-        ocp.cost.yref_e = np.array([self.force_ref])
+        ocp.cost.yref_e = np.array([self.force_ref, 0.0])
 
         # ---------------------------------
         # ステージコストの離散化
@@ -404,11 +407,11 @@ class DRL_EKF_func_series:
         # ---------------------------------
 
         yref = np.array([
-            self.force_ref, 0.0, float(self.u_ref[0])
+            self.force_ref, 0.0, float(self.u_ref[0]), 0.0
         ])
         for k in range(self.K):
             solver.set(k, "yref", yref)
-        solver.set(self.K, "yref", np.array([self.force_ref]))
+        solver.set(self.K, "yref", np.array([self.force_ref, 0.0]))
 
         # ---------------------------------
         # 最適化計算
@@ -474,6 +477,8 @@ def main():
     print("force_ref [N]:", controller.force_ref)
     print("F_env: 0 if x < 0 else k*x (contact origin x=0)")
     print("q_force:", controller.q_force)
+    print("q_gap (experimental):", controller.q_gap)
+    print("cost dimensions: ny_0=4, ny=4, ny_e=2")
     print("q_balance:", controller.q_balance)
     print("q_force_terminal:", controller.q_force_terminal)
     print("u_ref [N]:", controller.u_ref)
