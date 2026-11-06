@@ -2,10 +2,13 @@
 
 状態は[速度, 接触面からの変位, 剛性]、入力は力、パラメータは等価質量。
 生成コマンド: python DRL_EKF_MPFC_for_3link_3.py
-生成後のupdate_acados.py --check / 通常更新は既存の手順を使用する。
+入力変化率項を追加。初回だけ同梱のMPCアダプタと適用通知を導入する。
+その後はupdate_acados.py --check / 通常更新を使用する。
 位置0が接触面、押し込む方向が正という前提。剛性の符号は変更しない。
 負位置でのみ接近コストを追加した試験用。実機の入力符号・挙動確認後に評価する。
 接触境界は非滑らかであり、SQP_RTIのstatus=0でも非線形予測残差が残り得る。
+変化率項は先頭入力だけを、計算開始時に把握した適用済みMPC指令と比較する。
+全予測段の隣接入力差分や、入力変化率の上限制約ではない。
 """
 
 import numpy as np
@@ -40,17 +43,23 @@ class DRL_EKF_func_series:
         # 接触中の力追従と、非接触時だけの接近を評価する。
         self.force_ref = 1.0
         self.q_force = 1
-        self.q_gap = 100.0  # 非接触時の接近コスト（試験値、位置の単位はm）
-        self.q_gap_terminal = 0.02 * self.q_gap
-        self.q_balance = 0.01
-        self.q_force_terminal = 0.02
-        self.R = casadi.DM.eye(self.nu) * 0.1
+        self.q_gap = 450.0  # 非接触時の接近コスト（試験値、位置の単位はm）
+        self.q_gap_terminal = 50 * self.q_gap
+        self.q_balance = 0.1
+        self.q_force_terminal = 0.00
+        self.R = casadi.DM.eye(self.nu) * 3.5
+
+        # 先頭入力の変化率: R_delta * ((u0 - u_applied) / T)^2。
+        # T=0.010ならR_delta=0.001は差分二乗の重み10に相当する。
+        # acadosのNLSには1/2とステージ時間Tの係数も付く。
+        self.R_delta = 1.0e-3
+        self.last_applied_input = 0.0
 
         # =================================
         # MPCパラメータ
         # =================================
 
-        self.T = 0.020            # サンプリング時間 [s]
+        self.T = 0.010            # サンプリング時間 [s]
         self.K = 4              # ホライゾン
         self.T_all = 1.0
         self.max_iter = 2
@@ -219,7 +228,11 @@ class DRL_EKF_func_series:
         gap = casadi.if_else(x[1] < 0.0, x[1], 0.0)
         outputs = casadi.vertcat(f_env, u[0] - f_env, u[0], gap)
 
-        ocp.model.cost_y_expr_0 = outputs
+        if not np.isfinite(self.T) or self.T <= 0.0:
+            raise ValueError("T must be finite and positive")
+        if not np.isfinite(self.R_delta) or self.R_delta < 0.0:
+            raise ValueError("R_delta must be finite and nonnegative")
+        ocp.model.cost_y_expr_0 = casadi.vertcat(outputs, u[0] / self.T)
         ocp.model.cost_y_expr = outputs
         ocp.model.cost_y_expr_e = casadi.vertcat(f_env, gap)
 
@@ -229,10 +242,10 @@ class DRL_EKF_func_series:
         yref = np.array([
             self.force_ref, 0.0, float(self.u_ref[0]), 0.0
         ])
-        ocp.cost.W_0 = W.copy()
+        ocp.cost.W_0 = np.diag([*np.diag(W), self.R_delta])
         ocp.cost.W = W.copy()
         ocp.cost.W_e = np.diag([self.q_force_terminal, self.q_gap_terminal])
-        ocp.cost.yref_0 = yref.copy()
+        ocp.cost.yref_0 = np.append(yref, self.last_applied_input / self.T)
         ocp.cost.yref = yref.copy()
         ocp.cost.yref_e = np.array([self.force_ref, 0.0])
 
@@ -360,14 +373,31 @@ class DRL_EKF_func_series:
             active_solver.set(stage, "p", values)
         self.M_wy = mass
 
+    def notify_applied_input(self, applied_input):
+        """実際に採用したMPC力指令[N]を通知する（最適解の算出だけでは更新しない）。
+
+        保持中は通知不要。適用を0へ切り替えた場合は0を通知する。
+        実際の接触力やDOB補償後のアクチュエータ力ではない。
+        """
+        value = float(applied_input)
+        if not np.isfinite(value):
+            raise ValueError("applied_input must be finite")
+        self.last_applied_input = value
+
     def compute_optimal_control_acados(
         self,
         solver,
         x_init,
         x_ref,
         u_seq,
-        equivalent_mass=None
+        equivalent_mass=None,
+        previous_applied_input=None
     ):
+
+        # 明示値があれば前回の適用済み指令を更新する。u_seqはguess専用。
+        if previous_applied_input is not None:
+            self.notify_applied_input(previous_applied_input)
+        applied_snapshot = self.last_applied_input
 
         # 1回のsolve中では同じ質量を使う。未指定時は最後に設定した質量を使う。
         mass = self.M_wy if equivalent_mass is None else equivalent_mass
@@ -409,7 +439,8 @@ class DRL_EKF_func_series:
         yref = np.array([
             self.force_ref, 0.0, float(self.u_ref[0]), 0.0
         ])
-        for k in range(self.K):
+        solver.set(0, "yref", np.append(yref, applied_snapshot / self.T))
+        for k in range(1, self.K):
             solver.set(k, "yref", yref)
         solver.set(self.K, "yref", np.array([self.force_ref, 0.0]))
 
@@ -478,7 +509,9 @@ def main():
     print("F_env: 0 if x < 0 else k*x (contact origin x=0)")
     print("q_force:", controller.q_force)
     print("q_gap (experimental):", controller.q_gap)
-    print("cost dimensions: ny_0=4, ny=4, ny_e=2")
+    print("cost dimensions: ny_0=5, ny=4, ny_e=2")
+    print("R_delta (first applied input rate):", controller.R_delta)
+    print("rate cost: R_delta * ((u0 - applied_u_at_solve_start) / T)^2")
     print("q_balance:", controller.q_balance)
     print("q_force_terminal:", controller.q_force_terminal)
     print("u_ref [N]:", controller.u_ref)
