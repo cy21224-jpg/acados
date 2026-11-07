@@ -50,10 +50,10 @@ class DRL_EKF_func_series:
         self.T = 0.010
 
 
-        # function_3link.c の param_init() と同じEKF初期値。
-        # 状態 [速度, 位置, 剛性]、観測 [速度, 位置]。
+        # 既存の雑音スケールを維持し、EKF2の観測次元3へ拡張。
+        # 状態 [速度, 位置, 剛性]、観測 [速度, 位置, 反力]。
         self.Qkf = 1.0e-3 * np.eye(3)
-        self.Rkf = 1.0e-6 * np.eye(2)
+        self.Rkf = 1.0e-6 * np.eye(3)
         self.x_init = casadi.DM([0.0, 0.0, 0.0])
 
         # 既存のシミュレーション用設定。
@@ -114,97 +114,104 @@ class DRL_EKF_func_series:
         return sin_waves + noise_level * gaussian_noise
 
 
+    @np.errstate(all="ignore")
     def EKF(self, y_k, u_k_1, M_wy_k_1, x_hat_k_1, P_k_1, Rkf, Qkf):
-        """function_3link.c の EKF を同じ計算順序で実行する。
+        """function_kalmanfilter.c の EKF2 をfloat32で同じ順序で実行する。
 
-        状態: [速度, 位置, 環境剛性]、観測: [速度, 位置]。
-        y_k: (2,), u_k_1: (3,), x_hat_k_1: (3,), P_k_1: (3,3),
-        Rkf: (2,2), Qkf: (3,3)。列ベクトルも受け取る。
-        u_k_1 はCと同じ3成分であり、力だけを使う場合は [force, 0, 0]。
-        M_wy_k_1 は前回の等価質量、self.T はCの sampling_time に対応する。
-        戻り値は (x_hat_k, P_k)。入力配列は変更しない。
+        状態: [速度, 位置, 環境剛性]、観測: [速度, 位置, 環境反力]。
+        y_k/u_k_1/x_hat_k_1: (3,)、P_k_1/Rkf/Qkf: (3,3)。
+        ベクトルは(3,1)も可。self.TはCのsampling_timeに合わせる。
+        Bdは力u[0]だけを予測へ入れ、Bd_KFは3成分の雑音を写像する。
+        観測予測はh(x_minus)=[v_minus,x_minus,k_minus*x_minus]。
+        添付Cと同じく負位置でも符号付きk*xを使い、クリップしない。
+        行列補助関数へfloat32配列を渡し、各演算・累積でfloatへ丸める。
+        戻り値は従来と同じ(x_hat_kのリスト, P_kのリスト)。入力は不変。
 
-        行列積・転置・逆行列・加減算には既存の補助関数を使う。
-        Pythonの演算精度は通常float64、Cのfloatは通常float32。
+        Cは逆行列の失敗を検査せず続行するため、この関数も同じ扱い。
+        数値の有限性・質量の正値検査は追加しない。NaN/Infも伝播する。
+        Python側の形状検査だけを行う。FMA等の実機コンパイラ差は別途。
         """
-        # Python側の入出力検査。下の予測・更新式はCと同じ。
-        y_k = np.asarray(y_k, dtype=float).reshape(-1)
-        u_k_1 = np.asarray(u_k_1, dtype=float).reshape(-1)
-        x_hat_k_1 = np.asarray(x_hat_k_1, dtype=float).reshape(-1)
-        P_k_1 = np.asarray(P_k_1, dtype=float)
-        Rkf = np.asarray(Rkf, dtype=float)
-        Qkf = np.asarray(Qkf, dtype=float)
+        y_k = np.asarray(y_k, dtype=np.float32).reshape(-1)
+        u_k_1 = np.asarray(u_k_1, dtype=np.float32).reshape(-1)
+        x_hat_k_1 = np.asarray(x_hat_k_1, dtype=np.float32).reshape(-1)
+        P_k_1 = np.asarray(P_k_1, dtype=np.float32)
+        Rkf = np.asarray(Rkf, dtype=np.float32)
+        Qkf = np.asarray(Qkf, dtype=np.float32)
         for name, value, shape in (
-            ("y_k", y_k, (2,)),
+            ("y_k", y_k, (3,)),
             ("u_k_1", u_k_1, (3,)),
             ("x_hat_k_1", x_hat_k_1, (3,)),
             ("P_k_1", P_k_1, (3, 3)),
-            ("Rkf", Rkf, (2, 2)),
+            ("Rkf", Rkf, (3, 3)),
             ("Qkf", Qkf, (3, 3)),
         ):
-            if value.shape != shape or not np.all(np.isfinite(value)):
-                raise ValueError(f"{name} は形状{shape}の有限値で指定してください")
-        M_wy_k_1 = float(M_wy_k_1)
-        T = float(self.T)
-        if not np.isfinite(M_wy_k_1) or M_wy_k_1 <= 0.0:
-            raise ValueError("M_wy_k_1 は正の有限値で指定してください")
-        if not np.isfinite(T) or T <= 0.0:
-            raise ValueError("self.T は正の有限値で指定してください")
-
+            if value.shape != shape:
+                raise ValueError(f"{name} は形状{shape}で指定してください")
+        M_wy_k_1 = np.float32(M_wy_k_1)
+        T = np.float32(self.T)
         dot_y_c_k = x_hat_k_1[0]
         y_c_k = x_hat_k_1[1]
         k_env_k = x_hat_k_1[2]
 
-        # Cと同じ状態依存ヤコビアン。状態の予測式そのものとは区別する。
-        Ad_KF = [
+        Ad_KF = np.array([
             [1.0, -(T * k_env_k) / M_wy_k_1, -(T * y_c_k) / M_wy_k_1],
             [T, 1.0, 0.0],
             [0.0, 0.0, 1.0],
-        ]
-        Bd_KF = [
+        ], dtype=np.float32)
+        # 共分散の予測に使う雑音行列。
+        Bd_KF = np.array([
             [T / M_wy_k_1, 0.0, 0.0],
             [0.0, T, 0.0],
             [0.0, 0.0, T],
-        ]
-        Cd_KF = [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
+        ], dtype=np.float32)
+        # 状態の予測に使う入力行列（u[1], u[2]の係数は0）。
+        Bd = np.array([
+            [T / M_wy_k_1, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ], dtype=np.float32)
 
-        x_hat_k = [0.0] * 3
-        P_k = [[0.0] * 3 for _ in range(3)]
-        Ad_x = [0.0] * 3
-        Bd_u = [0.0] * 3
-        x_hat_minus_k_KF = [0.0] * 3
-        Ad_P = [[0.0] * 3 for _ in range(3)]
-        Ad_KF_tp = [[0.0] * 3 for _ in range(3)]
-        P_minus_k_KF1 = [[0.0] * 3 for _ in range(3)]
-        Bd_KF_tp = [[0.0] * 3 for _ in range(3)]
-        Bd_KF_Qkf = [[0.0] * 3 for _ in range(3)]
-        P_minus_k_KF2 = [[0.0] * 3 for _ in range(3)]
-        P_minus_k_KF = [[0.0] * 3 for _ in range(3)]
-        P_Cd = [[0.0] * 2 for _ in range(3)]
-        Cd_KF_tp = [[0.0] * 2 for _ in range(3)]
-        Cd_P = [[0.0] * 3 for _ in range(2)]
-        Cd_P_Cd_tp = [[0.0] * 2 for _ in range(2)]
-        den = [[0.0] * 2 for _ in range(2)]
-        den_inv = [[0.0] * 2 for _ in range(2)]
-        g_k_KF = [[0.0] * 2 for _ in range(3)]
-        Cd_KF_x = [0.0] * 2
-        y_Cd_x = [0.0] * 2
-        g_k_y_Cd_x = [0.0] * 3
-        I = [[0.0] * 3 for _ in range(3)]
-        g_k_Cd = [[0.0] * 3 for _ in range(3)]
-        I_g_k_Cd = [[0.0] * 3 for _ in range(3)]
+        x_hat_k = np.zeros(3, dtype=np.float32)
+        P_k = np.zeros((3, 3), dtype=np.float32)
+        Ad_x = np.zeros(3, dtype=np.float32)
+        Bd_u = np.zeros(3, dtype=np.float32)
+        x_hat_minus_k_KF = np.zeros(3, dtype=np.float32)
+        Ad_P = np.zeros((3, 3), dtype=np.float32)
+        Ad_KF_tp = np.zeros((3, 3), dtype=np.float32)
+        P_minus_k_KF1 = np.zeros((3, 3), dtype=np.float32)
+        Bd_KF_tp = np.zeros((3, 3), dtype=np.float32)
+        Bd_KF_Qkf = np.zeros((3, 3), dtype=np.float32)
+        P_minus_k_KF2 = np.zeros((3, 3), dtype=np.float32)
+        P_minus_k_KF = np.zeros((3, 3), dtype=np.float32)
+        P_Cd = np.zeros((3, 3), dtype=np.float32)
+        Cd_KF_tp = np.zeros((3, 3), dtype=np.float32)
+        Cd_P = np.zeros((3, 3), dtype=np.float32)
+        Cd_P_Cd_tp = np.zeros((3, 3), dtype=np.float32)
+        den = np.zeros((3, 3), dtype=np.float32)
+        den_inv = np.zeros((3, 3), dtype=np.float32)
+        g_k_KF = np.zeros((3, 3), dtype=np.float32)
+        Cd_KF_x = np.zeros(3, dtype=np.float32)
+        y_Cd_x = np.zeros(3, dtype=np.float32)
+        g_k_y_Cd_x = np.zeros(3, dtype=np.float32)
+        I = np.zeros((3, 3), dtype=np.float32)
+        g_k_Cd = np.zeros((3, 3), dtype=np.float32)
+        I_g_k_Cd = np.zeros((3, 3), dtype=np.float32)
 
         # --- 推定ステップ: Cと同じ非線形Euler予測 ---
         Ad_x[0] = dot_y_c_k - (T * k_env_k * y_c_k) / M_wy_k_1
         Ad_x[1] = T * dot_y_c_k + y_c_k
         Ad_x[2] = k_env_k
-        self.mat_vec_mul(3, 3, Bd_KF, u_k_1, Bd_u)
+        self.mat_vec_mul(3, 3, Bd, u_k_1, Bd_u)
         self.add_vec(3, Ad_x, Bd_u, x_hat_minus_k_KF)
 
-        # --- 事前共分散: Ad*P*Ad.T + Bd*Q*Bd.T ---
+        # 観測ヤコビアンは予測後の位置・剛性から作る。
+        Cd_KF = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, x_hat_minus_k_KF[2], x_hat_minus_k_KF[1]],
+        ], dtype=np.float32)
+
+        # --- 事前共分散: Ad*P*Ad.T + Bd_KF*Q*Bd_KF.T ---
         self.mul_mat(3, 3, 3, 3, Ad_KF, P_k_1, Ad_P)
         self.transpose_mat(3, 3, Ad_KF, Ad_KF_tp)
         self.mul_mat(3, 3, 3, 3, Ad_P, Ad_KF_tp, P_minus_k_KF1)
@@ -214,28 +221,30 @@ class DRL_EKF_func_series:
         self.add_mat(3, 3, P_minus_k_KF1, P_minus_k_KF2, P_minus_k_KF)
 
         # --- 更新ステップ: カルマンゲイン ---
-        self.transpose_mat(2, 3, Cd_KF, Cd_KF_tp)
-        self.mul_mat(3, 3, 3, 2, P_minus_k_KF, Cd_KF_tp, P_Cd)
-        self.mul_mat(2, 3, 3, 3, Cd_KF, P_minus_k_KF, Cd_P)
-        self.mul_mat(2, 3, 3, 2, Cd_P, Cd_KF_tp, Cd_P_Cd_tp)
-        self.add_mat(2, 2, Cd_P_Cd_tp, Rkf, den)
-        if self.inv_mat(2, den, den_inv) != 0:
-            raise np.linalg.LinAlgError("EKFの観測残差共分散を逆行列化できません")
-        self.mul_mat(3, 2, 2, 2, P_Cd, den_inv, g_k_KF)
+        self.transpose_mat(3, 3, Cd_KF, Cd_KF_tp)
+        self.mul_mat(3, 3, 3, 3, P_minus_k_KF, Cd_KF_tp, P_Cd)
+        self.mul_mat(3, 3, 3, 3, Cd_KF, P_minus_k_KF, Cd_P)
+        self.mul_mat(3, 3, 3, 3, Cd_P, Cd_KF_tp, Cd_P_Cd_tp)
+        self.add_mat(3, 3, Cd_P_Cd_tp, Rkf, den)
+        # 添付CのEKF2と同じく戻り値で分岐しない。
+        self.inv_mat(3, den, den_inv)
+        self.mul_mat(3, 3, 3, 3, P_Cd, den_inv, g_k_KF)
 
-        # --- 事後推定 ---
-        self.mat_vec_mul(2, 3, Cd_KF, x_hat_minus_k_KF, Cd_KF_x)
-        self.sub_vec(2, y_k, Cd_KF_x, y_Cd_x)
-        self.mat_vec_mul(3, 2, g_k_KF, y_Cd_x, g_k_y_Cd_x)
+        # H*xではなく非線形観測h(x)を使う。
+        Cd_KF_x[0] = x_hat_minus_k_KF[0]
+        Cd_KF_x[1] = x_hat_minus_k_KF[1]
+        Cd_KF_x[2] = x_hat_minus_k_KF[2] * x_hat_minus_k_KF[1]
+        self.sub_vec(3, y_k, Cd_KF_x, y_Cd_x)
+        self.mat_vec_mul(3, 3, g_k_KF, y_Cd_x, g_k_y_Cd_x)
         self.add_vec(3, x_hat_minus_k_KF, g_k_y_Cd_x, x_hat_k)
 
-        # --- 事後共分散: Cと同じ (I-K*C)*P_minus ---
+        # --- 事後共分散: Cと同じ(I-K*H)*P_minus ---
         self.eye_mat(3, I)
-        self.mul_mat(3, 2, 2, 3, g_k_KF, Cd_KF, g_k_Cd)
+        self.mul_mat(3, 3, 3, 3, g_k_KF, Cd_KF, g_k_Cd)
         self.sub_mat(3, 3, I, g_k_Cd, I_g_k_Cd)
         self.mul_mat(3, 3, 3, 3, I_g_k_Cd, P_minus_k_KF, P_k)
 
-        return x_hat_k, P_k
+        return x_hat_k.tolist(), P_k.tolist()
 
 
     def custom_lpf_step(self, x, y_prev, cutoff_freq, dt):
@@ -379,7 +388,7 @@ class DRL_EKF_func_series:
                     inv[i][j], inv[max_row][j] = inv[max_row][j], inv[i][j]
 
             # 逆行列が存在しないチェック
-            if abs(temp[i][i]) < 1e-14:
+            if float(abs(temp[i][i])) < 1e-14:
                 print("逆行列が存在しません")
                 return -1
 

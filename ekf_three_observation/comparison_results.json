@@ -1,0 +1,34 @@
+{
+  "reference_function": "EKF2",
+  "python_method": "EKF",
+  "arithmetic": "IEEE-754 float32, scalar loop order",
+  "source_sha256": "51a6bed1be735b8afe2ce2bf9d06360eb9fc5491bcf90ddd3168b4bdafe0e7cc",
+  "helpers_sha256": "6aac1769fd28a8e9f0a3db73eb7c42037f4763b89b8135fd6cc1e1d7969ec0a5",
+  "compiler": "gcc (Debian 14.2.0-19) 14.2.0",
+  "native_builds": [
+    "-O0 -ffp-contract=off",
+    "-O2 -ffp-contract=off"
+  ],
+  "firmware_modified": false,
+  "stm32_bitwise_equivalence_measured": false,
+  "cases": {
+    "independent_recurrence_300": "bitwise equal at every feedback step, separate C and Python evolving state and covariance",
+    "random_500": "bitwise equal state and covariance for both native builds; signed x/k, correlated P/Q/R, nonzero u[0:3], variable T/M",
+    "python_interface": "column vectors accepted; input arrays unchanged; old two-observation shape rejected",
+    "constructor": "three-state and three-observation covariance shapes",
+    "force_observation": {
+      "k_with_force_0_2": 79.8136978149414,
+      "k_with_force_1_2": 80.1244125366211
+    },
+    "inverse_threshold_boundary": "status and inverse match at float32(1e-14) and adjacent float32 values; C double threshold preserved",
+    "deterministic_input_mapping": "u1/u2 finite do not affect state/covariance; Bd differs from Bd_KF",
+    "nonlinear_H_h": "H uses predicted k/x; innovation uses k*x rather than H*x (which doubles force)",
+    "C_error_semantics": "ignored inverse failure reproduced; negative mass accepted as in C; NaN/zero-mass classifications agree",
+    "zero_innovation": "negative position, x=0, signed stiffness; bilateral k*x preserved; nonlinear h produces zero correction"
+  },
+  "comparisons_per_native_build": 512,
+  "max_abs_state_error": 0.0,
+  "max_abs_covariance_error": 0.0,
+  "source_unchanged": true,
+  "helpers_unchanged": true
+}
